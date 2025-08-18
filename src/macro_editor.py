@@ -3,6 +3,8 @@ from tkinter import filedialog, messagebox, simpledialog
 import threading
 from macro_recorder import MacroRecorderCore
 from pynput import keyboard
+import os
+import json
 
 STEP_WIDTH = 18
 STEP_HEIGHT = 2
@@ -15,7 +17,7 @@ class MacroEditorApp:
         self.root.geometry("1200x700")
 
         self.recorder = MacroRecorderCore()
-        self.recorder.ui_callback = lambda: self.root.after(0, self.render_sections)
+        self.recorder.ui_callback = self._ui_callback
         self.recorder.playback_ui_callback = self._playback_highlight
 
         self.stop_event = None
@@ -26,6 +28,16 @@ class MacroEditorApp:
         self.gap_chips = []
         self.selected_steps = {}  # (section_idx, step_idx) -> label
         self.last_clicked = None  # Last clicked step for single-step movement
+        self.last_recorded_step = None  # (section_idx, step_idx) of last recorded step
+        self.pending_update = False
+
+        # Load temp macro if exists
+        temp_file = "temp_macro.json"
+        if os.path.exists(temp_file):
+            self.load_macro(temp_file)
+
+        # Bind window close event
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
         # ===== Top controls (stay pinned) =====
         top = tk.Frame(root)
@@ -71,6 +83,7 @@ class MacroEditorApp:
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<Up>", self._on_arrow_key)
         self.canvas.bind("<Down>", self._on_arrow_key)
+        self.canvas.bind("<Delete>", self.delete_selected_steps)
 
         self._bind_mousewheel(self.canvas)
 
@@ -79,6 +92,45 @@ class MacroEditorApp:
 
         self.active_section_index = 0
         self.render_sections()
+
+        self.root.bind("<FocusIn>", self._on_focus_in)
+        self.root.bind("<Map>", self._on_map)
+
+    def _on_closing(self):
+        self.save_temp_macro()
+        self.root.destroy()
+
+    def save_temp_macro(self):
+        temp_file = "temp_macro.json"
+        with self.recorder._lock:
+            data = {
+                "sections": self.recorder.sections,
+                "delays_between": self.recorder.delays_between
+            }
+        try:
+            with open(temp_file, "w") as f:
+                json.dump(data, f)
+        except Exception:
+            pass  # Silently fail to avoid interrupting close
+
+    def _ui_callback(self):
+        if self._is_visible():
+            self.root.after(0, self.render_sections)
+        else:
+            self.pending_update = True
+
+    def _is_visible(self):
+        return self.root.state() != 'iconic' and self.root.focus_get() is not None
+
+    def _on_focus_in(self, event):
+        if self.pending_update:
+            self.render_sections()
+            self.pending_update = False
+
+    def _on_map(self, event):
+        if self.pending_update:
+            self.render_sections()
+            self.pending_update = False
 
     def _on_sections_configure(self, _event=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -132,8 +184,6 @@ class MacroEditorApp:
         self.step_menus = []
         self.step_labels = []
         self.gap_chips = []
-        self.selected_steps = {}
-        self.last_clicked = None
 
         for w in self.sections_frame.winfo_children():
             w.destroy()
@@ -218,7 +268,12 @@ class MacroEditorApp:
         row.pack(fill="x", pady=2)
 
         text = self._step_label(step)
-        lbl = tk.Label(row, text=text, bd=1, relief="solid", width=STEP_WIDTH, height=STEP_HEIGHT, anchor="center", bg="white")
+        bg_color = "white"
+        if self.last_recorded_step == (section_idx, step_idx):
+            bg_color = "#FFFF99"  # Yellow for last recorded step
+        elif (section_idx, step_idx) in self.selected_steps:
+            bg_color = "#D3D3D3"  # Gray for selected steps
+        lbl = tk.Label(row, text=text, bd=1, relief="solid", width=STEP_WIDTH, height=STEP_HEIGHT, anchor="center", bg=bg_color)
         lbl.pack(side="left")
         self.step_labels[section_idx].append(lbl)
 
@@ -226,7 +281,10 @@ class MacroEditorApp:
             key = (si, sti)
             if event.state & 0x4:  # Control key held
                 if key in self.selected_steps:
-                    self.selected_steps[key].config(bg="white")
+                    if key == self.last_recorded_step:
+                        self.selected_steps[key].config(bg="#FFFF99")
+                    else:
+                        self.selected_steps[key].config(bg="white")
                     del self.selected_steps[key]
                 else:
                     self.selected_steps[key] = lbl
@@ -275,8 +333,11 @@ class MacroEditorApp:
             if step_idx >= 0:
                 if 0 <= sec_idx < len(self.step_labels) and 0 <= step_idx < len(self.step_labels[sec_idx]):
                     lbl = self.step_labels[sec_idx][step_idx]
-                    if (sec_idx, step_idx) not in self.selected_steps:
-                        lbl.config(bg=bg_color)
+                    if (sec_idx, step_idx) == self.last_recorded_step:
+                        bg_color = "#FFFF99" if not active else "#ADD8E6"
+                    elif (sec_idx, step_idx) in self.selected_steps:
+                        bg_color = "#D3D3D3" if not active else "#ADD8E6"
+                    lbl.config(bg=bg_color)
                     widget = lbl
             else:
                 gap_idx = sec_idx
@@ -290,7 +351,10 @@ class MacroEditorApp:
 
     def clear_selection(self):
         for (si, sti), lbl in self.selected_steps.items():
-            lbl.config(bg="white")
+            if (si, sti) == self.last_recorded_step:
+                lbl.config(bg="#FFFF99")
+            else:
+                lbl.config(bg="white")
         self.selected_steps.clear()
 
     def _on_arrow_key(self, event):
@@ -313,47 +377,133 @@ class MacroEditorApp:
             if si not in sections:
                 sections[si] = []
             sections[si].append(sti)
-        
+
+        new_selected_steps = {}
         for si in sections:
             indices = sorted(sections[si])
-            if direction == "Up" and indices[0] > 0:
-                self.recorder.move_steps_up(si, indices)
-            elif direction == "Down" and indices[-1] < len(self.recorder.snapshot_sections()[si]["steps"]) - 1:
-                self.recorder.move_steps_down(si, indices)
-        
-        self.render_sections()
+            if len(indices) == max(indices) - min(indices) + 1:  # Consecutive
+                if direction == "Up" and indices[0] > 0:
+                    self.recorder.block_move_up(si, indices[0], indices[-1])
+                    for idx in indices:
+                        new_selected_steps[(si, idx - 1)] = self.selected_steps[(si, idx)]
+                elif direction == "Down" and indices[-1] < len(self.recorder.snapshot_sections()[si]["steps"]) - 1:
+                    self.recorder.block_move_down(si, indices[0], indices[-1])
+                    for idx in indices:
+                        new_selected_steps[(si, idx + 1)] = self.selected_steps[(si, idx)]
+                else:
+                    new_selected_steps.update({(si, idx): self.selected_steps[(si, idx)] for idx in indices})
+            else:
+                # Non-consecutive, move each
+                if direction == "Up":
+                    for idx in sorted(indices, reverse=True):
+                        if idx > 0:
+                            self.recorder.move_step_up(si, idx)
+                            new_selected_steps[(si, idx - 1)] = self.selected_steps[(si, idx)]
+                        else:
+                            new_selected_steps[(si, idx)] = self.selected_steps[(si, idx)]
+                elif direction == "Down":
+                    for idx in sorted(indices):
+                        if idx < len(self.recorder.snapshot_sections()[si]["steps"]) - 1:
+                            self.recorder.move_step_down(si, idx)
+                            new_selected_steps[(si, idx + 1)] = self.selected_steps[(si, idx)]
+                        else:
+                            new_selected_steps[(si, idx)] = self.selected_steps[(si, idx)]
+
+        self.selected_steps = new_selected_steps
+        if self._is_visible():
+            self.render_sections()
+        else:
+            self.pending_update = True
+
+    def delete_selected_steps(self, event=None):
+        selected = sorted(self.selected_steps.keys(), key=lambda x: (x[0], x[1]), reverse=True)
+        for si, sti in selected:
+            self.recorder.delete_step(si, sti)
+            if self.last_recorded_step == (si, sti):
+                self.last_recorded_step = None
+        self.selected_steps.clear()
+        if self._is_visible():
+            self.render_sections()
+        else:
+            self.pending_update = True
 
     def add_section(self):
-        idx = self.recorder.add_section(f"Section {len(self.recorder.sections) + 0}")
+        idx = self.recorder.add_section(f"Section {len(self.recorder.sections) + 1}")
         self.active_section_index = idx
-        self.render_sections()
+        if self._is_visible():
+            self.render_sections()
+        else:
+            self.pending_update = True
 
     def delete_section(self, idx):
         self.recorder.delete_section(idx)
         if self.active_section_index is not None:
             if self.active_section_index >= len(self.recorder.snapshot_sections()):
                 self.active_section_index = max(0, len(self.recorder.snapshot_sections()) - 1)
-        self.render_sections()
+        if self.last_recorded_step and self.last_recorded_step[0] == idx:
+            self.last_recorded_step = None
+        self.selected_steps = {(si, sti): lbl for (si, sti), lbl in self.selected_steps.items() if si != idx}
+        if self._is_visible():
+            self.render_sections()
+        else:
+            self.pending_update = True
 
     def select_section(self, idx):
         self.active_section_index = idx
         self.recorder.active_section_index = idx
-        self.render_sections()
+        if self._is_visible():
+            self.render_sections()
+        else:
+            self.pending_update = True
 
     def move_section_left(self, idx):
         self.recorder.move_section_left(idx)
+        if self._is_visible():
+            self.render_sections()
+        else:
+            self.pending_update = True
 
     def move_section_right(self, idx):
         self.recorder.move_section_right(idx)
+        if self._is_visible():
+            self.render_sections()
+        else:
+            self.pending_update = True
 
     def delete_step(self, section_idx, step_idx):
         self.recorder.delete_step(section_idx, step_idx)
+        if self.last_recorded_step == (section_idx, step_idx):
+            self.last_recorded_step = None
+        if (section_idx, step_idx) in self.selected_steps:
+            del self.selected_steps[(section_idx, step_idx)]
+        if self._is_visible():
+            self.render_sections()
+        else:
+            self.pending_update = True
 
     def move_step_up(self, section_idx, step_idx):
         self.recorder.move_step_up(section_idx, step_idx)
+        if self.last_recorded_step == (section_idx, step_idx):
+            self.last_recorded_step = (section_idx, step_idx - 1)
+        if (section_idx, step_idx) in self.selected_steps:
+            lbl = self.selected_steps.pop((section_idx, step_idx))
+            self.selected_steps[(section_idx, step_idx - 1)] = lbl
+        if self._is_visible():
+            self.render_sections()
+        else:
+            self.pending_update = True
 
     def move_step_down(self, section_idx, step_idx):
         self.recorder.move_step_down(section_idx, step_idx)
+        if self.last_recorded_step == (section_idx, step_idx):
+            self.last_recorded_step = (section_idx, step_idx + 1)
+        if (section_idx, step_idx) in self.selected_steps:
+            lbl = self.selected_steps.pop((section_idx, step_idx))
+            self.selected_steps[(section_idx, step_idx + 1)] = lbl
+        if self._is_visible():
+            self.render_sections()
+        else:
+            self.pending_update = True
 
     def edit_delay(self, section_idx, step_idx):
         current = self.recorder.snapshot_sections()[section_idx]["steps"][step_idx]
@@ -378,15 +528,21 @@ class MacroEditorApp:
 
     def toggle_recording(self):
         if self.recorder.recording:
+            sections = self.recorder.snapshot_sections()
+            if self.active_section_index is not None:
+                steps = sections[self.active_section_index]["steps"]
+                self.last_recorded_step = (self.active_section_index, len(steps) - 1) if steps else None
             self.recorder.stop_recording()
             self.record_button.config(text="Start Recording", bg="SystemButtonFace")
+            if self._is_visible():
+                self.render_sections()
+            else:
+                self.pending_update = True
         else:
             if self.active_section_index is None or self.active_section_index >= len(self.recorder.sections):
                 messagebox.showerror("Error", "Select a section first.")
                 return
-            new_name = simpledialog.askstring("Rename Section", "Enter new section name:", parent=self.root)
-            if new_name and new_name.strip():
-                self.recorder.rename_section(self.active_section_index, new_name.strip())
+            self.last_recorded_step = None
             self.recorder.start_recording(self.active_section_index)
             self.record_button.config(text="Stop Recording", bg="red")
             if self.auto_minimize_var.get():
@@ -421,17 +577,37 @@ class MacroEditorApp:
 
     def clear_all(self):
         self.recorder.clear_all()
+        self.last_recorded_step = None
+        self.selected_steps.clear()
+        temp_file = "temp_macro.json"
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
+        if self._is_visible():
+            self.render_sections()
+        else:
+            self.pending_update = True
 
-    def save_macro(self):
-        file = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+    def save_macro(self, file=None):
+        if file is None:
+            file = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
         if file:
             self.recorder.save_macro(file)
             messagebox.showinfo("Save", "Macro saved.")
 
-    def load_macro(self):
-        file = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
+    def load_macro(self, file=None):
+        if file is None:
+            file = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
         if file:
             self.recorder.load_macro(file)
+            self.last_recorded_step = None
+            self.selected_steps.clear()
+            if self._is_visible():
+                self.render_sections()
+            else:
+                self.pending_update = True
 
 
 if __name__ == "__main__":

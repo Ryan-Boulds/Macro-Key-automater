@@ -232,32 +232,24 @@ class MacroRecorderCore:
                     steps[step_index + 1], steps[step_index] = steps[step_index], steps[step_index + 1]
         self._notify_ui()
 
-    def move_steps_up(self, section_index, step_indices):
+    def block_move_up(self, section_index, start_idx, end_idx):
         with self._lock:
             if 0 <= section_index < len(self.sections):
                 steps = self.sections[section_index]["steps"]
-                step_indices = sorted(step_indices)
-                if step_indices[0] > 0:
-                    new_steps = steps[:]
-                    offset = 0
-                    for idx in step_indices:
-                        new_steps[idx - 1 + offset], new_steps[idx + offset] = new_steps[idx + offset], new_steps[idx - 1 + offset]
-                        offset -= 1
-                    self.sections[section_index]["steps"] = new_steps
+                if 0 <= start_idx <= end_idx < len(steps) and start_idx > 0:
+                    block = steps[start_idx:end_idx + 1]
+                    steps[start_idx:end_idx + 1] = []
+                    steps[start_idx - 1:start_idx - 1] = block
         self._notify_ui()
 
-    def move_steps_down(self, section_index, step_indices):
+    def block_move_down(self, section_index, start_idx, end_idx):
         with self._lock:
             if 0 <= section_index < len(self.sections):
                 steps = self.sections[section_index]["steps"]
-                step_indices = sorted(step_indices, reverse=True)
-                if step_indices[0] < len(steps) - 1:
-                    new_steps = steps[:]
-                    offset = 0
-                    for idx in step_indices:
-                        new_steps[idx + offset], new_steps[idx + 1 + offset] = new_steps[idx + 1 + offset], new_steps[idx + offset]
-                        offset += 1
-                    self.sections[section_index]["steps"] = new_steps
+                if 0 <= start_idx <= end_idx < len(steps) - 1:
+                    block = steps[start_idx:end_idx + 1]
+                    steps[start_idx:end_idx + 1] = []
+                    steps[end_idx + 1:end_idx + 1] = block
         self._notify_ui()
 
     def edit_delay(self, section_index, step_index, new_delay_ms):
