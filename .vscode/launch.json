@@ -1,0 +1,16 @@
+{
+    // VS Code debug configurations
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Always Run macro_editor.py",
+            "type": "python",
+            "request": "launch",
+
+            // 👇 Point directly to your script
+            "program": "C:/Users/ami6985/OneDrive - AISIN WORLD CORP/Documents/Macro Key automater/src/macro_editor.py",
+
+            "console": "integratedTerminal"
+        }
+    ]
+}

@@ -1,51 +1,53 @@
 import time
-from pynput import keyboard
+from pynput import keyboard, mouse
 import pyautogui
 import json
 import threading
 
 
 class MacroRecorderCore:
-    """
-    Headless core: manages sections, inter-column delays, recording, and playback.
-    UI registers `ui_callback` which is invoked after any change.
-    """
     def __init__(self):
-        # Sections: [{ "name": str, "steps": [ {"type": "press"/"release"/"delay", ...}, ... ] }]
         self.sections = []
-        # Delays BETWEEN columns (gaps). If there are N sections, there are N-1 gaps.
-        # delays_between[i] is the delay between sections[i] and sections[i+1], in ms.
         self.delays_between = []
-
         self.recording = False
         self.listener = None
+        self.mouse_listener = None
         self.last_time = None
         self.pressed_keys = set()
         self.active_section_index = None
-
-        self.ui_callback = None   # set by UI: a zero-arg callable
+        self.ui_callback = None
+        self.playback_ui_callback = None
         self._lock = threading.Lock()
+        self._last_ui_update = 0
+        self._ui_update_interval = 0.1  # 100ms
 
-    # ---------- Internal helpers ----------
     def _notify_ui(self):
-        cb = self.ui_callback
+        current_time = time.time()
+        if current_time - self._last_ui_update >= self._ui_update_interval:
+            cb = self.ui_callback
+            if cb:
+                try:
+                    cb()
+                    self._last_ui_update = current_time
+                except Exception:
+                    pass
+
+    def _playback_notify(self, section_idx, step_idx, active):
+        cb = self.playback_ui_callback
         if cb:
             try:
-                cb()
+                cb(section_idx, step_idx, active)
             except Exception:
                 pass
 
     def _ensure_gap_count(self):
-        """Keep len(delays_between) == max(0, len(sections)-1)."""
         n = max(0, len(self.sections) - 1)
         if len(self.delays_between) < n:
             self.delays_between.extend([0] * (n - len(self.delays_between)))
         elif len(self.delays_between) > n:
             self.delays_between = self.delays_between[:n]
 
-    # ---------- Recording ----------
     def start_recording(self, section_index):
-        """Start recording into a given section index (append-only)."""
         with self._lock:
             if self.recording or section_index is None or section_index < 0 or section_index >= len(self.sections):
                 return
@@ -54,8 +56,15 @@ class MacroRecorderCore:
             self.pressed_keys.clear()
             self.last_time = time.time() * 1000
 
-            self.listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
-            self.listener.start()
+            try:
+                self.listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
+                self.listener.start()
+                self.mouse_listener = mouse.Listener(on_click=self._on_mouse_click)
+                self.mouse_listener.start()
+            except Exception as e:
+                self.recording = False
+                self.active_section_index = None
+                raise e
 
         self._notify_ui()
 
@@ -67,6 +76,13 @@ class MacroRecorderCore:
             if self.listener:
                 self.listener.stop()
                 self.listener = None
+            if self.mouse_listener:
+                self.mouse_listener.stop()
+                self.mouse_listener = None
+            if self.active_section_index is not None:
+                steps = self.sections[self.active_section_index]["steps"]
+                if steps and steps[-1].get("type") in ("mouse_press", "mouse_release"):
+                    steps.pop()
             self.pressed_keys.clear()
             self.active_section_index = None
         self._notify_ui()
@@ -109,11 +125,31 @@ class MacroRecorderCore:
                 self.last_time = current_time
         self._notify_ui()
 
-    # ---------- Sections & Steps ----------
+    def _on_mouse_click(self, x, y, button, pressed):
+        with self._lock:
+            if not self.recording or self.active_section_index is None:
+                return
+            current_time = time.time() * 1000
+            button_map = {
+                mouse.Button.left: 'left',
+                mouse.Button.right: 'right',
+                mouse.Button.middle: 'middle'
+            }
+            button_str = button_map.get(button)
+            if button_str is None:
+                return
+            action_type = "mouse_press" if pressed else "mouse_release"
+            if self.last_time is not None:
+                delay = int(current_time - self.last_time)
+                if delay > 0:
+                    self._add_step_no_lock({"type": "delay", "delay": delay, "unit": "ms"})
+            self._add_step_no_lock({"type": action_type, "x": int(x), "y": int(y), "button": button_str})
+            self.last_time = current_time
+        self._notify_ui()
+
     def add_section(self, name="New Section"):
         with self._lock:
             self.sections.append({"name": name, "steps": []})
-            # Adding a section increases gaps by 1 if there is at least one prior section.
             self._ensure_gap_count()
             idx = len(self.sections) - 1
         self._notify_ui()
@@ -126,12 +162,6 @@ class MacroRecorderCore:
         self._notify_ui()
 
     def delete_section(self, idx):
-        """Delete a whole section/column and reconcile the BETWEEN gaps.
-
-        If deleting at the ends, remove the adjacent gap.
-        If deleting a middle section, merge the two adjacent gaps by SUM
-        so the overall time between the neighbors is preserved.
-        """
         with self._lock:
             if not (0 <= idx < len(self.sections)):
                 return
@@ -139,32 +169,25 @@ class MacroRecorderCore:
             if n == 0:
                 return
 
-            # Reconcile gaps
             if n == 1:
                 self.sections.pop(idx)
                 self.delays_between.clear()
             else:
-                # There are n-1 gaps currently
                 if idx == 0:
-                    # Remove first section: remove gap[0]
                     self.sections.pop(0)
                     if self.delays_between:
                         self.delays_between.pop(0)
                 elif idx == n - 1:
-                    # Remove last section: remove last gap
                     self.sections.pop()
                     if self.delays_between:
                         self.delays_between.pop()
                 else:
-                    # Middle: merge gaps idx-1 and idx into one (sum)
                     left = self.delays_between[idx - 1]
                     right = self.delays_between[idx]
                     merged = int(left) + int(right)
                     self.sections.pop(idx)
-                    # Replace left gap with merged, then remove right gap
                     self.delays_between[idx - 1] = merged
                     self.delays_between.pop(idx)
-            # Active recording index may shift
             if self.active_section_index is not None:
                 if self.active_section_index == idx:
                     self.active_section_index = None
@@ -209,6 +232,34 @@ class MacroRecorderCore:
                     steps[step_index + 1], steps[step_index] = steps[step_index], steps[step_index + 1]
         self._notify_ui()
 
+    def move_steps_up(self, section_index, step_indices):
+        with self._lock:
+            if 0 <= section_index < len(self.sections):
+                steps = self.sections[section_index]["steps"]
+                step_indices = sorted(step_indices)
+                if step_indices[0] > 0:
+                    new_steps = steps[:]
+                    offset = 0
+                    for idx in step_indices:
+                        new_steps[idx - 1 + offset], new_steps[idx + offset] = new_steps[idx + offset], new_steps[idx - 1 + offset]
+                        offset -= 1
+                    self.sections[section_index]["steps"] = new_steps
+        self._notify_ui()
+
+    def move_steps_down(self, section_index, step_indices):
+        with self._lock:
+            if 0 <= section_index < len(self.sections):
+                steps = self.sections[section_index]["steps"]
+                step_indices = sorted(step_indices, reverse=True)
+                if step_indices[0] < len(steps) - 1:
+                    new_steps = steps[:]
+                    offset = 0
+                    for idx in step_indices:
+                        new_steps[idx + offset], new_steps[idx + 1 + offset] = new_steps[idx + 1 + offset], new_steps[idx + offset]
+                        offset += 1
+                    self.sections[section_index]["steps"] = new_steps
+        self._notify_ui()
+
     def edit_delay(self, section_index, step_index, new_delay_ms):
         with self._lock:
             if 0 <= section_index < len(self.sections):
@@ -221,7 +272,6 @@ class MacroRecorderCore:
         self._notify_ui()
 
     def set_between_delay(self, gap_index, ms):
-        """Set delay between sections[gap_index] and sections[gap_index+1]."""
         with self._lock:
             if 0 <= gap_index < len(self.delays_between):
                 self.delays_between[gap_index] = int(ms)
@@ -235,11 +285,9 @@ class MacroRecorderCore:
         self._notify_ui()
 
     def move_section_left(self, idx):
-        """Swap section idx with idx-1. Gaps remain positioned BETWEEN columns."""
         with self._lock:
             if 1 <= idx < len(self.sections):
                 self.sections[idx - 1], self.sections[idx] = self.sections[idx], self.sections[idx - 1]
-                # Gaps tied to positions: leave self.delays_between unchanged.
                 if self.active_section_index == idx:
                     self.active_section_index = idx - 1
                 elif self.active_section_index == idx - 1:
@@ -250,27 +298,28 @@ class MacroRecorderCore:
         with self._lock:
             if 0 <= idx < len(self.sections) - 1:
                 self.sections[idx + 1], self.sections[idx] = self.sections[idx], self.sections[idx + 1]
-                # Gaps tied to positions: leave self.delays_between unchanged.
                 if self.active_section_index == idx:
                     self.active_section_index = idx + 1
                 elif self.active_section_index == idx + 1:
                     self.active_section_index = idx
         self._notify_ui()
 
-    # ---------- Playback ----------
     def play_all(self, stop_event=None):
-        # iterate left-to-right sections, top-to-bottom steps
         snapshot = self.snapshot_sections()
         gaps = self.snapshot_between_delays()
         for s_idx, section in enumerate(snapshot):
-            for action in section["steps"]:
+            for a_idx, action in enumerate(section["steps"]):
                 if stop_event and stop_event.is_set():
                     return
+                self._playback_notify(s_idx, a_idx, True)
                 self._execute_action(action, stop_event)
-            # Inter-column delay (between sections)
+                self._playback_notify(s_idx, a_idx, False)
             if s_idx < len(snapshot) - 1:
                 delay_ms = int(gaps[s_idx]) if s_idx < len(gaps) else 0
-                self._sleep_with_interrupt(delay_ms / 1000.0, stop_event)
+                if delay_ms > 0:
+                    self._playback_notify(s_idx, -1, True)
+                    self._sleep_with_interrupt(delay_ms / 1000.0, stop_event)
+                    self._playback_notify(s_idx, -1, False)
 
     def _sleep_with_interrupt(self, seconds, stop_event=None):
         start = time.time()
@@ -297,7 +346,7 @@ class MacroRecorderCore:
         elif t == "press":
             key = action.get("key")
             if key in ("cmd", "cmd_r", "win"):
-                pyautogui.keyDown("winleft")  # Windows key
+                pyautogui.keyDown("winleft")
             else:
                 pyautogui.keyDown(key)
         elif t == "release":
@@ -306,8 +355,15 @@ class MacroRecorderCore:
                 pyautogui.keyUp("winleft")
             else:
                 pyautogui.keyUp(key)
+        elif t == "mouse_press":
+            x, y, btn = action["x"], action["y"], action["button"]
+            pyautogui.moveTo(x, y)
+            pyautogui.mouseDown(button=btn)
+        elif t == "mouse_release":
+            x, y, btn = action["x"], action["y"], action["button"]
+            pyautogui.moveTo(x, y)
+            pyautogui.mouseUp(button=btn)
 
-    # ---------- Persistence ----------
     def save_macro(self, path):
         with self._lock:
             data = {
@@ -321,10 +377,8 @@ class MacroRecorderCore:
         with open(path, "r") as f:
             data = json.load(f)
         with self._lock:
-            # Backward compatibility with old flat list files
             if isinstance(data, list):
                 self.sections = data
-                # infer gaps
                 self.delays_between = [0] * max(0, len(self.sections) - 1)
             else:
                 self.sections = data.get("sections", [])
@@ -332,7 +386,6 @@ class MacroRecorderCore:
             self._ensure_gap_count()
         self._notify_ui()
 
-    # ---------- Snapshots ----------
     def snapshot_sections(self):
         with self._lock:
             return [{"name": s["name"], "steps": list(s["steps"])} for s in self.sections]
