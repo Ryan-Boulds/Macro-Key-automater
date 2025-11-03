@@ -1,0 +1,132 @@
+# macro_recorder/recorder.py
+import time
+from pynput import keyboard, mouse
+from typing import Set, Optional, Tuple
+
+from .utils import normalize_key
+from .merger import merge_steps
+
+
+class Recorder:
+    def __init__(self, core):
+        self.core = core
+        self.listener: Optional[keyboard.Listener] = None
+        self.mouse_listener: Optional[mouse.Listener] = None
+        self.last_time: Optional[float] = None
+        self.pressed_keys: Set[str] = set()
+        self._pre_record_len: int = 0
+
+    # ------------------------------------------------------------------ #
+    # Public API – called by core.py
+    # ------------------------------------------------------------------ #
+    def start(self, section_index: Tuple[int, int]):
+        row, col = section_index
+        with self.core._lock:
+            if self.core.recording:
+                return
+            if not (0 <= row < len(self.core.rows) and 0 <= col < len(self.core.rows[row])):
+                return
+
+            self.core.recording = True
+            self.core.active_section_index = section_index
+            steps = self.core.rows[row][col]["steps"]
+            self._pre_record_len = len(steps)
+            self.pressed_keys.clear()
+            self.last_time = time.time() * 1000
+
+            try:
+                self.listener = keyboard.Listener(
+                    on_press=self._on_press,
+                    on_release=self._on_release,
+                )
+                self.listener.start()
+
+                self.mouse_listener = mouse.Listener(on_click=self._on_mouse_click)
+                self.mouse_listener.start()
+            except Exception as e:
+                self.core.recording = False
+                self.core.active_section_index = None
+                raise e
+
+    def stop(self):
+        with self.core._lock:
+            if not self.core.recording:
+                return
+
+            self.core.recording = False
+            if self.listener:
+                self.listener.stop()
+                self.listener = None
+            if self.mouse_listener:
+                self.mouse_listener.stop()
+                self.mouse_listener = None
+
+            if self.core.active_section_index is not None:
+                row, col = self.core.active_section_index
+                steps = self.core.rows[row][col]["steps"]
+                # Remove trailing incomplete events
+                while steps and steps[-1].get("type") in ("mouse_press", "mouse_release", "press", "release"):
+                    steps.pop()
+                # Merge raw events into high-level actions
+                new_part = merge_steps(steps[self._pre_record_len:])
+                steps[self._pre_record_len:] = new_part
+
+            self.pressed_keys.clear()
+            self.core.active_section_index = None
+
+    # ------------------------------------------------------------------ #
+    # Listener callbacks
+    # ------------------------------------------------------------------ #
+    def _add_step(self, step: dict):
+        if self.core.active_section_index is None:
+            return
+        row, col = self.core.active_section_index
+        self.core.rows[row][col]["steps"].append(step)
+
+    def _on_press(self, key):
+        now = time.time() * 1000
+        k = normalize_key(key)
+        if k not in self.pressed_keys:
+            self.pressed_keys.add(k)
+            if self.last_time is not None:
+                delay = int(now - self.last_time)
+                self._add_step({"type": "delay", "delay": delay, "unit": "ms"})
+            self._add_step({"type": "press", "key": k})
+            self.last_time = now
+        self.core._notify_ui()  # outside lock
+
+    def _on_release(self, key):
+        now = time.time() * 1000
+        k = normalize_key(key)
+        if k in self.pressed_keys:
+            self.pressed_keys.remove(k)
+            if self.last_time is not None:
+                delay = int(now - self.last_time)
+                self._add_step({"type": "delay", "delay": delay, "unit": "ms"})
+            self._add_step({"type": "release", "key": k})
+            self.last_time = now
+        self.core._notify_ui()
+
+    def _on_mouse_click(self, x, y, button, pressed):
+        if not self.core.recording or self.core.active_section_index is None:
+            return
+        now = time.time() * 1000
+        button_map = {
+            mouse.Button.left: "left",
+            mouse.Button.right: "right",
+            mouse.Button.middle: "middle",
+        }
+        button_str = button_map.get(button)
+        if button_str is None:
+            return
+
+        action_type = "mouse_press" if pressed else "mouse_release"
+        if self.last_time is not None:
+            delay = int(now - self.last_time)
+            if delay > 0:
+                self._add_step({"type": "delay", "delay": delay, "unit": "ms"})
+        self._add_step(
+            {"type": action_type, "x": int(x), "y": int(y), "button": button_str}
+        )
+        self.last_time = now
+        self.core._notify_ui()

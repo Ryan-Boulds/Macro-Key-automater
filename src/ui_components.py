@@ -45,15 +45,28 @@ def step_label(step):
     return "Unknown"
 
 def render_gap_chip(app, gap_index, value_ms):
-    frame = tk.Frame(app.sections_frame)
-    chip = tk.Frame(frame, bd=1, relief="ridge", bg="white")
-    chip.pack(fill="y", expand=True, padx=2, pady=2)
-    app.gap_chips.append(chip)
+    frame = tk.Frame(app.sections_frame, width=60)
+    frame.pack_propagate(False)  # Prevent resizing
 
-    tk.Label(chip, text="Between", font=("TkDefaultFont", 8)).pack(padx=6, pady=(6, 0))
+    chip = tk.Frame(frame, bd=1, relief="ridge", bg="white")
+    chip.pack(fill="both", expand=True, padx=2, pady=2)
+    app.gap_chips[gap_index[0]].append(chip)
+
+    tk.Label(chip, text="Between", font=("TkDefaultFont", 8)).pack(pady=(6, 0))
     var = tk.StringVar(value=str(value_ms))
     entry = tk.Entry(chip, textvariable=var, width=6, justify="center")
-    entry.pack(padx=6, pady=4)
+    entry.pack(pady=2)
+
+    def apply():
+        try:
+            ms = int(float(var.get()))
+            if ms < 0: raise ValueError
+            app.recorder.set_gap_delay(gap_index, ms)
+        except ValueError:
+            messagebox.showerror("Error", "Enter a valid delay (ms).")
+
+    tk.Button(chip, text="Set ms", command=apply).pack(pady=(0, 6))
+    return frame
 
     def apply():
         try:
@@ -74,6 +87,7 @@ def render_section(app, idx, section):
     frame = tk.Frame(app.sections_frame, bd=2, relief="groove", highlightthickness=2)
     frame.configure(highlightbackground=border_color, highlightcolor=border_color)
 
+    # Header
     header = tk.Frame(frame)
     header.pack(fill="x", padx=6, pady=6)
 
@@ -83,72 +97,56 @@ def render_section(app, idx, section):
     name_entry.bind("<Return>", lambda _e, i=idx, v=name_var: app.recorder.rename_section(i, v.get()))
     name_entry.bind("<FocusOut>", lambda _e, i=idx, v=name_var: app.recorder.rename_section(i, v.get()))
 
-    tk.Button(header, text="←", width=3, command=lambda i=idx: app.move_section_left(i)).pack(side="left", padx=2)
-    tk.Button(header, text="→", width=3, command=lambda i=idx: app.move_section_right(i)).pack(side="left", padx=2)
+    tk.Button(header, text="Left", width=3, command=lambda i=idx: app.move_section_left(i)).pack(side="left", padx=2)
+    tk.Button(header, text="Right", width=3, command=lambda i=idx: app.move_section_right(i)).pack(side="left", padx=2)
     record_btn = tk.Button(header, text="Record Here", command=lambda i=idx: app.select_section(i))
     if is_active:
         record_btn.config(bg="red")
     record_btn.pack(side="left", padx=6)
     tk.Button(header, text="Delete", command=lambda i=idx: app.delete_section(i)).pack(side="left", padx=6)
 
+    # Steps
     steps_wrap = tk.Frame(frame)
     steps_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
+    row_idx, sec_idx = idx
+    app.step_labels[row_idx][sec_idx] = []
+
     for s_idx, step in enumerate(section["steps"]):
-        row = tk.Frame(steps_wrap)
-        row.pack(fill="x", pady=2)
+        step_frame = tk.Frame(steps_wrap)
+        step_frame.pack(fill="x", pady=1)
 
         text = step_label(step)
         bg_color = "white"
-        if app.last_recorded_step == (idx, s_idx):
+        if app.last_recorded_step == (row_idx, sec_idx, s_idx):
             bg_color = "#FFFF99"
-        elif (idx, s_idx) in app.selected_steps:
+        elif ((row_idx, sec_idx), s_idx) in app.selection.selected_indices:
             bg_color = "#D3D3D3"
-        lbl = tk.Label(row, text=text, bd=1, relief="solid", width=STEP_WIDTH, height=STEP_HEIGHT, anchor="center", bg=bg_color)
-        lbl.pack(side="left")
-        app.step_labels[idx].append(lbl)
 
-        def toggle_selection(event, si=idx, sti=s_idx):
-            key = (si, sti)
-            if event.state & 0x4:  # Control key held
-                if key in app.selected_steps:
-                    if key == app.last_recorded_step:
-                        app.selected_steps[key].config(bg="#FFFF99")
-                    else:
-                        app.selected_steps[key].config(bg="white")
-                    del app.selected_steps[key]
-                else:
-                    app.selected_steps[key] = lbl
-                    lbl.config(bg="#D3D3D3")
-            else:
-                app.clear_selection()
-                app.selected_steps[key] = lbl
-                lbl.config(bg="#D3D3D3")
-            app.last_clicked = key
 
-        lbl.bind("<Button-1>", lambda e, si=idx, sti=s_idx: toggle_selection(e, si, sti))
-        lbl.bind("<Control-Button-1>", lambda e, si=idx, sti=s_idx: toggle_selection(e, si, sti))
+        lbl = tk.Label(step_frame, text=text, bd=1, relief="solid", width=STEP_WIDTH, height=STEP_HEIGHT,
+                       anchor="w", justify="left", bg=bg_color, wraplength=300)
+        lbl.pack(side="left", fill="x", expand=True)
+        app.step_labels[row_idx][sec_idx].append(lbl)
 
+        # Click to select
+        def make_toggle(si, sti):
+            def toggle(event):
+                app.selection.toggle(si, sti, lbl, event.state & 0x4)
+            return toggle
+        lbl.bind("<Button-1>", make_toggle((row_idx, sec_idx), s_idx))
+
+        # Context menu
         menu = tk.Menu(app.root, tearoff=0)
         app.step_menus.append(menu)
-        menu.add_command(label="Delete", command=lambda si=idx, sti=s_idx: app.delete_step(si, sti))
-        t = step.get("type")
-        if t == "delay":
-            menu.add_command(label="Edit Delay…", command=lambda si=idx, sti=s_idx: app.edit_delay(si, sti))
-        elif t == "key_group":
-            menu.add_command(label="Edit Group…", command=lambda si=idx, sti=s_idx: edit_key_group(app, si, sti))
-        elif t == "mouse_click":
-            menu.add_command(label="Edit Click…", command=lambda si=idx, sti=s_idx: edit_mouse_click(app, si, sti))
-        elif t == "typed":
-            menu.add_command(label="Edit Typed…", command=lambda si=idx, sti=s_idx: edit_typed(app, si, sti))
-        lbl.bind("<Button-3>", lambda e, m=menu: m.post(e.x_root, e.y_root))
+        menu.add_command(label="Delete", command=lambda si=(row_idx, sec_idx), sti=s_idx: app.delete_step(si, sti))
+        if step.get("type") == "delay":
+            menu.add_command(label="Edit Delay...", command=lambda: messagebox.showinfo("Edit", "Not implemented yet"))
 
-        tk.Button(row, text="X", width=2, command=lambda si=idx, sti=s_idx: app.delete_step(si, sti)).pack(side="left", padx=2)
-
-        ctrl = tk.Frame(row)
-        ctrl.pack(side="left", padx=4)
-        tk.Button(ctrl, text="↑", width=2, command=lambda si=idx, sti=s_idx: app.move_step_up(si, sti)).pack(side="top")
-        tk.Button(ctrl, text="↓", width=2, command=lambda si=idx, sti=s_idx: app.move_step_down(si, sti)).pack(side="top")
+        def show_menu(e, m=menu):
+            try: m.tk_popup(e.x_root, e.y_root)
+            finally: m.grab_release()
+        lbl.bind("<Button-3>", show_menu)
 
     return frame
 
