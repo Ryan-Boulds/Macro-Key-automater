@@ -3,7 +3,7 @@ from pynput import keyboard, mouse
 import pyautogui
 import json
 import threading
-
+from utils import normalize_key
 
 class MacroRecorderCore:
     def __init__(self):
@@ -53,6 +53,7 @@ class MacroRecorderCore:
                 return
             self.recording = True
             self.active_section_index = section_index
+            self._pre_record_len = len(self.sections[section_index]["steps"])
             self.pressed_keys.clear()
             self.last_time = time.time() * 1000
 
@@ -65,7 +66,6 @@ class MacroRecorderCore:
                 self.recording = False
                 self.active_section_index = None
                 raise e
-
         self._notify_ui()
 
     def stop_recording(self):
@@ -81,25 +81,21 @@ class MacroRecorderCore:
                 self.mouse_listener = None
             if self.active_section_index is not None:
                 steps = self.sections[self.active_section_index]["steps"]
-                if steps and steps[-1].get("type") in ("mouse_press", "mouse_release"):
+                # Remove trailing incomplete press/release steps
+                while steps and steps[-1].get("type") in ("mouse_press", "mouse_release", "press", "release"):
                     steps.pop()
+                new_part = self._merge_steps(steps[self._pre_record_len:])
+                steps[self._pre_record_len:] = new_part
             self.pressed_keys.clear()
             self.active_section_index = None
         self._notify_ui()
-
-    def _normalize_key(self, key):
-        try:
-            return key.char
-        except AttributeError:
-            return str(key).replace("Key.", "")
 
     def _on_press(self, key):
         with self._lock:
             if self.active_section_index is None:
                 return
             current_time = time.time() * 1000
-            k = self._normalize_key(key)
-
+            k = normalize_key(key)
             if k not in self.pressed_keys:
                 self.pressed_keys.add(k)
                 if self.last_time is not None:
@@ -114,8 +110,7 @@ class MacroRecorderCore:
             if self.active_section_index is None:
                 return
             current_time = time.time() * 1000
-            k = self._normalize_key(key)
-
+            k = normalize_key(key)
             if k in self.pressed_keys:
                 self.pressed_keys.remove(k)
                 if self.last_time is not None:
@@ -130,11 +125,7 @@ class MacroRecorderCore:
             if not self.recording or self.active_section_index is None:
                 return
             current_time = time.time() * 1000
-            button_map = {
-                mouse.Button.left: 'left',
-                mouse.Button.right: 'right',
-                mouse.Button.middle: 'middle'
-            }
+            button_map = {mouse.Button.left: 'left', mouse.Button.right: 'right', mouse.Button.middle: 'middle'}
             button_str = button_map.get(button)
             if button_str is None:
                 return
@@ -146,6 +137,144 @@ class MacroRecorderCore:
             self._add_step_no_lock({"type": action_type, "x": int(x), "y": int(y), "button": button_str})
             self.last_time = current_time
         self._notify_ui()
+
+    def _merge_steps(self, steps):
+        new_steps = []
+        i = 0
+        modifier_keys = {"cmd", "cmd_r", "win", "ctrl", "alt", "shift", "enter", "tab", "esc", "backspace", "delete"}
+        shift_map = {
+            "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
+            "-": "_", "=": "+", ".": "."
+        }
+        allowed_chars = set("abcdefghijklmnopqrstuvwxyz0123456789. ")
+
+        while i < len(steps):
+            step = steps[i]
+            # Handle non-keyboard steps (e.g., delay, mouse actions)
+            if step["type"] not in ("press", "release", "delay"):
+                if step["type"] == "mouse_press":
+                    mouse_step = {"type": "mouse_click", "button": step["button"], "x": step["x"], "y": step["y"], "hold_ms": 0}
+                    i += 1
+                    while i < len(steps):
+                        next_step = steps[i]
+                        if next_step["type"] == "delay":
+                            mouse_step["hold_ms"] += next_step["delay"]
+                            i += 1
+                        elif next_step["type"] == "mouse_release" and next_step["button"] == step["button"]:
+                            mouse_step["release_x"] = next_step["x"]
+                            mouse_step["release_y"] = next_step["y"]
+                            i += 1
+                            break
+                        else:
+                            break
+                    new_steps.append(mouse_step)
+                else:
+                    new_steps.append(step)
+                    i += 1
+                continue
+
+            # Collect a sequence of keyboard-related steps
+            sub_steps = []
+            typed_chars = []
+            typed_delays = []
+            pressed_keys = set()
+            shift_pressed = False
+            j = i
+            while j < len(steps):
+                s = steps[j]
+                if s["type"] in ("press", "release", "delay"):
+                    sub_steps.append(s)
+                    if s["type"] == "press":
+                        pressed_keys.add(s["key"])
+                        if s["key"] == "shift":
+                            shift_pressed = True
+                    elif s["type"] == "release" and s["key"] in pressed_keys:
+                        pressed_keys.remove(s["key"])
+                        if s["key"] == "shift":
+                            shift_pressed = False
+                    j += 1
+                else:
+                    break
+
+            # Process the collected sequence
+            k = 0
+            last_char_added = None
+            current_key_group = []
+            last_delay = 0
+            while k < len(sub_steps):
+                s = sub_steps[k]
+                if s["type"] == "delay":
+                    last_delay = s["delay"]
+                    current_key_group.append(s)
+                    k += 1
+                elif s["type"] == "press" and s["key"] in modifier_keys:
+                    current_key_group.append(s)
+                    k += 1
+                elif s["type"] == "release" and s["key"] in modifier_keys and s["key"] in pressed_keys:
+                    current_key_group.append(s)
+                    pressed_keys.remove(s["key"])
+                    k += 1
+                    # If the key_group is complete, add it
+                    if not pressed_keys or all(key in modifier_keys for key in pressed_keys):
+                        if current_key_group and not all(s.get("key") == "shift" or s["type"] == "delay" for s in current_key_group):
+                            new_steps.append({"type": "key_group", "sub_steps": current_key_group})
+                        current_key_group = []
+                elif s["type"] == "press" and (
+                    s["key"] in allowed_chars or
+                    s["key"] == "space" or
+                    (shift_pressed and s["key"] in shift_map)
+                ):
+                    if current_key_group and not all(s.get("key") == "shift" or s["type"] == "delay" for s in current_key_group):
+                        new_steps.append({"type": "key_group", "sub_steps": current_key_group})
+                        current_key_group = []
+                    if shift_pressed and s["key"] in shift_map:
+                        char = shift_map[s["key"]]
+                    elif s["key"] == "space":
+                        char = " "
+                    else:
+                        char = s["key"]
+                    typed_chars.append(char)
+                    last_char_added = char
+                    k += 1
+                    # Look for the release and delay
+                    while k < len(sub_steps):
+                        next_s = sub_steps[k]
+                        if next_s["type"] == "release" and (
+                            next_s["key"] == s["key"] or
+                            (next_s["key"] == "shift" and shift_pressed) or
+                            next_s["key"] == "space"
+                        ):
+                            if next_s["key"] == "shift":
+                                shift_pressed = False
+                            k += 1
+                        elif next_s["type"] == "delay":
+                            typed_delays.append(next_s["delay"])
+                            k += 1
+                            break
+                        else:
+                            break
+                else:
+                    k += 1
+
+            # Add any collected typed step
+            if typed_chars:
+                new_steps.append({
+                    "type": "typed",
+                    "chars": "".join(typed_chars),
+                    "delays": typed_delays or [15] * (len(typed_chars) - 1)
+                })
+
+            # Add any remaining key_group steps
+            if current_key_group and not all(s.get("key") == "shift" or s["type"] == "delay" for s in current_key_group):
+                new_steps.append({"type": "key_group", "sub_steps": current_key_group})
+
+            # Move the index forward
+            i = j
+
+        # Add any leading or trailing delay as a separate step
+        if new_steps and new_steps[0]["type"] == "delay":
+            new_steps.insert(0, new_steps.pop(0))
+        return new_steps
 
     def add_section(self, name="New Section"):
         with self._lock:
@@ -168,7 +297,6 @@ class MacroRecorderCore:
             n = len(self.sections)
             if n == 0:
                 return
-
             if n == 1:
                 self.sections.pop(idx)
                 self.delays_between.clear()
@@ -193,7 +321,6 @@ class MacroRecorderCore:
                     self.active_section_index = None
                 elif self.active_section_index > idx:
                     self.active_section_index -= 1
-
             self._ensure_gap_count()
         self._notify_ui()
 
@@ -206,6 +333,16 @@ class MacroRecorderCore:
         with self._lock:
             if 0 <= section_index < len(self.sections):
                 self.sections[section_index]["steps"].append({"type": "delay", "delay": int(delay_ms), "unit": "ms"})
+        self._notify_ui()
+
+    def add_typed_step(self, section_index, chars, delay_ms):
+        with self._lock:
+            if 0 <= section_index < len(self.sections):
+                self.sections[section_index]["steps"].append({
+                    "type": "typed",
+                    "chars": chars,
+                    "delays": [int(delay_ms)] * (len(chars) - 1)
+                })
         self._notify_ui()
 
     def delete_step(self, section_index, step_index):
@@ -324,44 +461,46 @@ class MacroRecorderCore:
         t = action.get("type")
         if t == "delay":
             unit = action.get("unit", "ms")
-            if unit == "ms":
-                sleep_time = action["delay"] / 1000
-            elif unit == "secs":
-                sleep_time = action["delay"]
-            elif unit == "mins":
-                sleep_time = action["delay"] * 60
-            elif unit == "hrs":
-                sleep_time = action["delay"] * 3600
-            else:
-                sleep_time = action["delay"] / 1000
+            sleep_time = action["delay"] / 1000 if unit == "ms" else action["delay"] * (1 if unit == "secs" else 60 if unit == "mins" else 3600)
             self._sleep_with_interrupt(sleep_time, stop_event)
         elif t == "press":
             key = action.get("key")
-            if key in ("cmd", "cmd_r", "win"):
-                pyautogui.keyDown("winleft")
-            else:
-                pyautogui.keyDown(key)
+            pyautogui.keyDown("winleft" if key in ("cmd", "cmd_r", "win") else key)
         elif t == "release":
             key = action.get("key")
-            if key in ("cmd", "cmd_r", "win"):
-                pyautogui.keyUp("winleft")
-            else:
-                pyautogui.keyUp(key)
+            pyautogui.keyUp("winleft" if key in ("cmd", "cmd_r", "win") else key)
         elif t == "mouse_press":
-            x, y, btn = action["x"], action["y"], action["button"]
-            pyautogui.moveTo(x, y)
-            pyautogui.mouseDown(button=btn)
+            pyautogui.moveTo(action["x"], action["y"])
+            pyautogui.mouseDown(button=action["button"])
         elif t == "mouse_release":
-            x, y, btn = action["x"], action["y"], action["button"]
-            pyautogui.moveTo(x, y)
-            pyautogui.mouseUp(button=btn)
+            pyautogui.moveTo(action["x"], action["y"])
+            pyautogui.mouseUp(button=action["button"])
+        elif t == "key_group":
+            for sub in action["sub_steps"]:
+                self._execute_action(sub, stop_event)
+        elif t == "mouse_click":
+            pyautogui.moveTo(action["x"], action["y"])
+            pyautogui.mouseDown(button=action["button"])
+            self._sleep_with_interrupt(action["hold_ms"] / 1000.0, stop_event)
+            pyautogui.moveTo(action.get("release_x", action["x"]), action.get("release_y", action["y"]))
+            pyautogui.mouseUp(button=action["button"])
+        elif t == "typed":
+            chars = action["chars"]
+            delays = action["delays"]
+            for i, char in enumerate(chars):
+                if char in ("%", "^", "+", "(", ")", "{", "}", "~"):
+                    pyautogui.hotkey("shift", char)
+                elif char == " ":
+                    pyautogui.press("space")
+                else:
+                    pyautogui.press(char)
+                if i < len(chars) - 1:
+                    delay_ms = delays[i] if i < len(delays) else 15
+                    self._sleep_with_interrupt(delay_ms / 1000.0, stop_event)
 
     def save_macro(self, path):
         with self._lock:
-            data = {
-                "sections": self.sections,
-                "delays_between": self.delays_between
-            }
+            data = {"sections": self.sections, "delays_between": self.delays_between}
         with open(path, "w") as f:
             json.dump(data, f)
 
@@ -380,7 +519,7 @@ class MacroRecorderCore:
 
     def snapshot_sections(self):
         with self._lock:
-            return [{"name": s["name"], "steps": list(s["steps"])} for s in self.sections]
+            return [{"name": s["name"], "steps": [step.copy() for step in s["steps"]]} for s in self.sections]
 
     def snapshot_between_delays(self):
         with self._lock:

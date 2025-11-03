@@ -1,614 +1,197 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
-import threading
-from macro_recorder import MacroRecorderCore
-from pynput import keyboard
+from tkinter import filedialog, messagebox
 import os
 import json
 
-STEP_WIDTH = 18
-STEP_HEIGHT = 2
-
+from macro_recorder import MacroRecorderCore
+from top_bar import TopBar
+from playback_manager import PlaybackManager
+from selection_manager import SelectionManager
+from section_manager import SectionManager
+from ui_updater import UIUpdater
+from ui_components import render_section, render_gap_chip, add_typed_dialog
 
 class MacroEditorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Macro Recorder with Columns & Between Delays")
+        self.root.title("Macro Recorder")
         self.root.geometry("1200x700")
 
         self.recorder = MacroRecorderCore()
         self.recorder.ui_callback = self._ui_callback
         self.recorder.playback_ui_callback = self._playback_highlight
 
-        self.stop_event = None
-        self.interrupt_listener = None
+        self.playback = PlaybackManager(self)
+        self.selection = SelectionManager(self)
+        self.selected_steps = self.selection.selected_steps
+        self.section = SectionManager(self)
+        self.ui = UIUpdater(self)
 
         self.step_labels = []
         self.step_menus = []
         self.gap_chips = []
-        self.selected_steps = {}  # (section_idx, step_idx) -> label
-        self.last_clicked = None  # Last clicked step for single-step movement
-        self.last_recorded_step = None  # (section_idx, step_idx) of last recorded step
-        self.pending_update = False
+        self.last_recorded_step = None
+        self.active_section_index = 0
 
-        # Load temp macro if exists
-        temp_file = "temp_macro.json"
-        if os.path.exists(temp_file):
-            self.load_macro(temp_file)
+        # Load temp
+        if os.path.exists("temp_macro.json"):
+            self.load_macro("temp_macro.json")
 
-        # Bind window close event
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+        self.root.bind("<FocusIn>", lambda e: self.ui.on_focus())
+        self.root.bind("<Map>", lambda e: self.ui.on_focus())
 
-        # ===== Top controls (stay pinned) =====
-        top = tk.Frame(root)
-        top.pack(side="top", fill="x", pady=6)
+        # UI
+        self.top_bar = TopBar(root, self)
+        self._setup_canvas()
+        if not self.recorder.sections:
+            self.section.add("Section 1")
+        self.render_sections()
 
-        tk.Button(top, text="Add Column", command=self.add_section).pack(side="left", padx=4)
-        self.record_button = tk.Button(top, text="Start Recording", command=self.toggle_recording)
-        self.record_button.pack(side="left", padx=4)
-        tk.Button(top, text="Play Macro", command=self.play_macro).pack(side="left", padx=4)
-        tk.Button(top, text="Save", command=self.save_macro).pack(side="left", padx=4)
-        tk.Button(top, text="Load", command=self.load_macro).pack(side="left", padx=4)
-        tk.Button(top, text="Clear All", command=self.clear_all).pack(side="left", padx=4)
-
-        self.quick_delay_var = tk.StringVar(value="250")
-        tk.Label(top, text="Step Delay ms:").pack(side="left", padx=(16, 4))
-        tk.Entry(top, textvariable=self.quick_delay_var, width=6).pack(side="left")
-        tk.Button(top, text="Add Step Delay to Selected", command=self.add_quick_delay).pack(side="left", padx=4)
-
-        self.auto_minimize_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(top, text="Auto-minimize when recording", variable=self.auto_minimize_var).pack(side="left", padx=8)
-
-        # ===== Scrollable area (both directions) =====
-        outer = tk.Frame(root)
-        outer.pack(side="top", fill="both", expand=True)
+    def _setup_canvas(self):
+        outer = tk.Frame(self.root)
+        outer.pack(fill="both", expand=True)
 
         self.canvas = tk.Canvas(outer)
-        self.vscroll = tk.Scrollbar(outer, orient="vertical", command=self.canvas.yview)
-        self.hscroll = tk.Scrollbar(outer, orient="horizontal", command=self.canvas.xview)
-
-        self.canvas.configure(yscrollcommand=self.vscroll.set, xscrollcommand=self.hscroll.set)
+        v = tk.Scrollbar(outer, orient="vertical", command=self.canvas.yview)
+        h = tk.Scrollbar(outer, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=v.set, xscrollcommand=h.set)
 
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.vscroll.grid(row=0, column=1, sticky="ns")
-        self.hscroll.grid(row=1, column=0, sticky="ew")
-
+        v.grid(row=0, column=1, sticky="ns")
+        h.grid(row=1, column=0, sticky="ew")
         outer.rowconfigure(0, weight=1)
         outer.columnconfigure(0, weight=1)
 
         self.sections_frame = tk.Frame(self.canvas)
         self.canvas_window_id = self.canvas.create_window((0, 0), window=self.sections_frame, anchor="nw")
 
-        self.sections_frame.bind("<Configure>", self._on_sections_configure)
-        self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self.canvas.bind("<Up>", self._on_arrow_key)
-        self.canvas.bind("<Down>", self._on_arrow_key)
-        self.canvas.bind("<Delete>", self.delete_selected_steps)
+        self.sections_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(self.canvas_window_id, width=e.width))
 
-        self._bind_mousewheel(self.canvas)
+        self._bind_mousewheel()
 
-        if not self.recorder.sections:
-            self.recorder.add_section("Section 1")
+    def _bind_mousewheel(self):
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.canvas.bind_all(seq, self._on_mousewheel)
 
-        self.active_section_index = 0
-        self.render_sections()
+    def _on_mousewheel(self, event):
+        if event.num == 4 or event.delta > 0:
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5 or event.delta < 0:
+            self.canvas.yview_scroll(1, "units")
 
-        self.root.bind("<FocusIn>", self._on_focus_in)
-        self.root.bind("<Map>", self._on_map)
+    def _ui_callback(self):
+        self.ui.refresh()
+
+    def _playback_highlight(self, sec_idx, step_idx, active):
+        self.ui.highlight_playback(sec_idx, step_idx, active)
+
+    def _is_visible(self):
+        return self.root.state() != 'iconic' and self.root.focus_get() is not None
 
     def _on_closing(self):
         self.save_temp_macro()
         self.root.destroy()
 
     def save_temp_macro(self):
-        temp_file = "temp_macro.json"
-        with self.recorder._lock:
-            data = {
-                "sections": self.recorder.sections,
-                "delays_between": self.recorder.delays_between
-            }
         try:
-            with open(temp_file, "w") as f:
-                json.dump(data, f)
-        except Exception:
-            pass  # Silently fail to avoid interrupting close
-
-    def _ui_callback(self):
-        if self._is_visible():
-            self.root.after(0, self.render_sections)
-        else:
-            self.pending_update = True
-
-    def _is_visible(self):
-        return self.root.state() != 'iconic' and self.root.focus_get() is not None
-
-    def _on_focus_in(self, event):
-        if self.pending_update:
-            self.render_sections()
-            self.pending_update = False
-
-    def _on_map(self, event):
-        if self.pending_update:
-            self.render_sections()
-            self.pending_update = False
-
-    def _on_sections_configure(self, _event=None):
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-
-    def _on_canvas_configure(self, event):
-        self.canvas.itemconfig(self.canvas_window_id, width=max(event.width, self.sections_frame.winfo_reqwidth()))
-
-    def _bind_mousewheel(self, widget):
-        widget.bind_all("<MouseWheel>", self._on_mousewheel)
-        widget.bind_all("<Shift-MouseWheel>", self._on_shift_mousewheel)
-        widget.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
-        widget.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(+3, "units"))
-
-    def _on_mousewheel(self, event):
-        delta = -1 * int(event.delta / 120) if event.delta else 0
-        self.canvas.yview_scroll(delta, "units")
-
-    def _on_shift_mousewheel(self, event):
-        delta = -1 * int(event.delta / 120) if event.delta else 0
-        self.canvas.xview_scroll(delta, "units")
-
-    def _scroll_to_widget(self, widget):
-        x = 0
-        y = 0
-        w = widget
-        while w != self.sections_frame:
-            x += w.winfo_x()
-            y += w.winfo_y()
-            w = w.master
-        x += widget.winfo_width() / 2
-        y += widget.winfo_height() / 2
-
-        canvas_width = self.canvas.winfo_width()
-        canvas_height = self.canvas.winfo_height()
-        frame_width = self.sections_frame.winfo_width()
-        frame_height = self.sections_frame.winfo_height()
-
-        frac_x = max(0, min(1, (x - canvas_width / 2) / frame_width))
-        frac_y = max(0, min(1, (y - canvas_height / 2) / frame_height))
-
-        self.canvas.xview_moveto(frac_x)
-        self.canvas.yview_moveto(frac_y)
+            with open("temp_macro.json", "w") as f:
+                json.dump({"sections": self.recorder.sections, "delays_between": self.recorder.delays_between}, f)
+        except: pass
 
     def render_sections(self):
-        # Clean up existing menus
+        # Clear old
         for menu in self.step_menus:
-            try:
-                menu.destroy()
-            except:
-                pass
+            try: menu.destroy()
+            except: pass
         self.step_menus = []
-        self.step_labels = []
+        self.step_labels = [[] for _ in self.recorder.sections]
         self.gap_chips = []
-
         for w in self.sections_frame.winfo_children():
             w.destroy()
 
         sections = self.recorder.snapshot_sections()
         gaps = self.recorder.snapshot_between_delays()
 
-        self.step_labels = [[] for _ in sections]
-
         col = 0
-        for idx, section in enumerate(sections):
-            sec_frame = self._render_one_section(idx, section)
-            sec_frame.grid(row=0, column=col, padx=8, pady=8, sticky="n")
+        for idx, sec in enumerate(sections):
+            frame = render_section(self, idx, sec)
+            frame.grid(row=0, column=col, padx=8, pady=8, sticky="n")
             col += 1
-
             if idx < len(sections) - 1:
-                gap_index = idx
-                gap_frame = self._render_gap_chip(gap_index, gaps[gap_index] if gap_index < len(gaps) else 0)
-                gap_frame.grid(row=0, column=col, padx=(0, 0), pady=8, sticky="ns")
+                gap_frame = render_gap_chip(self, idx, gaps[idx])
+                gap_frame.grid(row=0, column=col, padx=(0,0), pady=8, sticky="ns")
                 col += 1
 
-        self._on_sections_configure()
-
-    def _render_gap_chip(self, gap_index, value_ms):
-        frame = tk.Frame(self.sections_frame)
-        chip = tk.Frame(frame, bd=1, relief="ridge", bg="white")
-        chip.pack(fill="y", expand=True, padx=2, pady=2)
-        self.gap_chips.append(chip)
-
-        tk.Label(chip, text="Between", font=("TkDefaultFont", 8)).pack(padx=6, pady=(6, 0))
-        var = tk.StringVar(value=str(value_ms))
-        entry = tk.Entry(chip, textvariable=var, width=6, justify="center")
-        entry.pack(padx=6, pady=4)
-
-        def apply():
-            try:
-                ms = int(float(var.get()))
-            except ValueError:
-                messagebox.showerror("Error", "Enter a valid delay (ms).")
-                return
-            self.recorder.set_between_delay(gap_index, ms)
-
-        btn = tk.Button(chip, text="Set ms", command=apply)
-        btn.pack(padx=6, pady=(0, 6))
-
-        return frame
-
-    def _render_one_section(self, idx, section):
-        is_active = (idx == self.active_section_index)
-        border_color = "#0078D7" if is_active else "#cccccc"
-
-        frame = tk.Frame(self.sections_frame, bd=2, relief="groove", highlightthickness=2)
-        frame.configure(highlightbackground=border_color, highlightcolor=border_color)
-
-        header = tk.Frame(frame)
-        header.pack(fill="x", padx=6, pady=6)
-
-        name_var = tk.StringVar(value=section["name"])
-        name_entry = tk.Entry(header, textvariable=name_var, justify="center")
-        name_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        name_entry.bind("<Return>", lambda _e, i=idx, v=name_var: self.recorder.rename_section(i, v.get()))
-        name_entry.bind("<FocusOut>", lambda _e, i=idx, v=name_var: self.recorder.rename_section(i, v.get()))
-
-        tk.Button(header, text="←", width=3, command=lambda i=idx: self.move_section_left(i)).pack(side="left", padx=2)
-        tk.Button(header, text="→", width=3, command=lambda i=idx: self.move_section_right(i)).pack(side="left", padx=2)
-        record_btn = tk.Button(header, text="Record Here", command=lambda i=idx: self.select_section(i))
-        if is_active:
-            record_btn.config(bg="red")
-        record_btn.pack(side="left", padx=6)
-        tk.Button(header, text="Delete", command=lambda i=idx: self.delete_section(i)).pack(side="left", padx=6)
-
-        steps_wrap = tk.Frame(frame)
-        steps_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-
-        for s_idx, step in enumerate(section["steps"]):
-            self._render_step(steps_wrap, idx, s_idx, step)
-
-        return frame
-
-    def _render_step(self, parent, section_idx, step_idx, step):
-        row = tk.Frame(parent)
-        row.pack(fill="x", pady=2)
-
-        text = self._step_label(step)
-        bg_color = "white"
-        if self.last_recorded_step == (section_idx, step_idx):
-            bg_color = "#FFFF99"  # Yellow for last recorded step
-        elif (section_idx, step_idx) in self.selected_steps:
-            bg_color = "#D3D3D3"  # Gray for selected steps
-        lbl = tk.Label(row, text=text, bd=1, relief="solid", width=STEP_WIDTH, height=STEP_HEIGHT, anchor="center", bg=bg_color)
-        lbl.pack(side="left")
-        self.step_labels[section_idx].append(lbl)
-
-        def toggle_selection(event, si=section_idx, sti=step_idx):
-            key = (si, sti)
-            if event.state & 0x4:  # Control key held
-                if key in self.selected_steps:
-                    if key == self.last_recorded_step:
-                        self.selected_steps[key].config(bg="#FFFF99")
-                    else:
-                        self.selected_steps[key].config(bg="white")
-                    del self.selected_steps[key]
-                else:
-                    self.selected_steps[key] = lbl
-                    lbl.config(bg="#D3D3D3")
-            else:
-                self.clear_selection()
-                self.selected_steps[key] = lbl
-                lbl.config(bg="#D3D3D3")
-            self.last_clicked = key
-
-        lbl.bind("<Button-1>", lambda e, si=section_idx, sti=step_idx: toggle_selection(e, si, sti))
-        lbl.bind("<Control-Button-1>", lambda e, si=section_idx, sti=step_idx: toggle_selection(e, si, sti))
-
-        menu = tk.Menu(self.root, tearoff=0)
-        self.step_menus.append(menu)
-        menu.add_command(label="Delete", command=lambda si=section_idx, sti=step_idx: self.delete_step(si, sti))
-        if step.get("type") == "delay":
-            menu.add_command(label="Edit Delay…", command=lambda si=section_idx, sti=step_idx: self.edit_delay(si, sti))
-        lbl.bind("<Button-3>", lambda e, m=menu: m.post(e.x_root, e.y_root))
-
-        tk.Button(row, text="X", width=2, command=lambda si=section_idx, sti=step_idx: self.delete_step(si, sti)).pack(side="left", padx=2)
-
-        ctrl = tk.Frame(row)
-        ctrl.pack(side="left", padx=4)
-        tk.Button(ctrl, text="↑", width=2, command=lambda si=section_idx, sti=step_idx: self.move_step_up(si, sti)).pack(side="top")
-        tk.Button(ctrl, text="↓", width=2, command=lambda si=section_idx, sti=step_idx: self.move_step_down(si, sti)).pack(side="top")
-
-    def _step_label(self, step):
-        t = step.get("type")
-        if t == "delay":
-            return f"Delay {step['delay']} {step.get('unit','ms')}"
-        if t == "press":
-            return f"{step['key']} (pressed)"
-        if t == "release":
-            return f"{step['key']} (released)"
-        if t == "mouse_press":
-            return f"Mouse {step['button']} press @ ({step['x']}, {step['y']})"
-        if t == "mouse_release":
-            return f"Mouse {step['button']} release @ ({step['x']}, {step['y']})"
-        return "Unknown"
-
-    def _playback_highlight(self, sec_idx, step_idx, active):
-        def do_highlight():
-            bg_color = "#ADD8E6" if active else "white"
-            widget = None
-            if step_idx >= 0:
-                if 0 <= sec_idx < len(self.step_labels) and 0 <= step_idx < len(self.step_labels[sec_idx]):
-                    lbl = self.step_labels[sec_idx][step_idx]
-                    if (sec_idx, step_idx) == self.last_recorded_step:
-                        bg_color = "#FFFF99" if not active else "#ADD8E6"
-                    elif (sec_idx, step_idx) in self.selected_steps:
-                        bg_color = "#D3D3D3" if not active else "#ADD8E6"
-                    lbl.config(bg=bg_color)
-                    widget = lbl
-            else:
-                gap_idx = sec_idx
-                if 0 <= gap_idx < len(self.gap_chips):
-                    chip = self.gap_chips[gap_idx]
-                    chip.config(bg=bg_color)
-                    widget = chip
-            if active and widget:
-                self._scroll_to_widget(widget)
-        self.root.after(0, do_highlight)
-
-    def clear_selection(self):
-        for (si, sti), lbl in self.selected_steps.items():
-            if (si, sti) == self.last_recorded_step:
-                lbl.config(bg="#FFFF99")
-            else:
-                lbl.config(bg="white")
-        self.selected_steps.clear()
-
-    def _on_arrow_key(self, event):
-        if not self.selected_steps:
-            if self.last_clicked:
-                si, sti = self.last_clicked
-                if event.keysym == "Up":
-                    self.move_step_up(si, sti)
-                elif event.keysym == "Down":
-                    self.move_step_down(si, sti)
-            return
-        self.move_selected_steps(event.keysym)
-
-    def move_selected_steps(self, direction):
-        if not self.selected_steps:
-            return
-        # Group selections by section
-        sections = {}
-        for (si, sti) in self.selected_steps:
-            if si not in sections:
-                sections[si] = []
-            sections[si].append(sti)
-
-        new_selected_steps = {}
-        for si in sections:
-            indices = sorted(sections[si])
-            if len(indices) == max(indices) - min(indices) + 1:  # Consecutive
-                if direction == "Up" and indices[0] > 0:
-                    self.recorder.block_move_up(si, indices[0], indices[-1])
-                    for idx in indices:
-                        new_selected_steps[(si, idx - 1)] = self.selected_steps[(si, idx)]
-                elif direction == "Down" and indices[-1] < len(self.recorder.snapshot_sections()[si]["steps"]) - 1:
-                    self.recorder.block_move_down(si, indices[0], indices[-1])
-                    for idx in indices:
-                        new_selected_steps[(si, idx + 1)] = self.selected_steps[(si, idx)]
-                else:
-                    new_selected_steps.update({(si, idx): self.selected_steps[(si, idx)] for idx in indices})
-            else:
-                # Non-consecutive, move each
-                if direction == "Up":
-                    for idx in sorted(indices, reverse=True):
-                        if idx > 0:
-                            self.recorder.move_step_up(si, idx)
-                            new_selected_steps[(si, idx - 1)] = self.selected_steps[(si, idx)]
-                        else:
-                            new_selected_steps[(si, idx)] = self.selected_steps[(si, idx)]
-                elif direction == "Down":
-                    for idx in sorted(indices):
-                        if idx < len(self.recorder.snapshot_sections()[si]["steps"]) - 1:
-                            self.recorder.move_step_down(si, idx)
-                            new_selected_steps[(si, idx + 1)] = self.selected_steps[(si, idx)]
-                        else:
-                            new_selected_steps[(si, idx)] = self.selected_steps[(si, idx)]
-
-        self.selected_steps = new_selected_steps
-        if self._is_visible():
-            self.render_sections()
-        else:
-            self.pending_update = True
-
-    def delete_selected_steps(self, event=None):
-        selected = sorted(self.selected_steps.keys(), key=lambda x: (x[0], x[1]), reverse=True)
-        for si, sti in selected:
-            self.recorder.delete_step(si, sti)
-            if self.last_recorded_step == (si, sti):
-                self.last_recorded_step = None
-        self.selected_steps.clear()
-        if self._is_visible():
-            self.render_sections()
-        else:
-            self.pending_update = True
-
-    def add_section(self):
-        idx = self.recorder.add_section(f"Section {len(self.recorder.sections) + 1}")
-        self.active_section_index = idx
-        if self._is_visible():
-            self.render_sections()
-        else:
-            self.pending_update = True
-
-    def delete_section(self, idx):
-        self.recorder.delete_section(idx)
-        if self.active_section_index is not None:
-            if self.active_section_index >= len(self.recorder.snapshot_sections()):
-                self.active_section_index = max(0, len(self.recorder.snapshot_sections()) - 1)
-        if self.last_recorded_step and self.last_recorded_step[0] == idx:
-            self.last_recorded_step = None
-        self.selected_steps = {(si, sti): lbl for (si, sti), lbl in self.selected_steps.items() if si != idx}
-        if self._is_visible():
-            self.render_sections()
-        else:
-            self.pending_update = True
-
-    def select_section(self, idx):
-        self.active_section_index = idx
-        self.recorder.active_section_index = idx
-        if self._is_visible():
-            self.render_sections()
-        else:
-            self.pending_update = True
-
-    def move_section_left(self, idx):
-        self.recorder.move_section_left(idx)
-        if self._is_visible():
-            self.render_sections()
-        else:
-            self.pending_update = True
-
-    def move_section_right(self, idx):
-        self.recorder.move_section_right(idx)
-        if self._is_visible():
-            self.render_sections()
-        else:
-            self.pending_update = True
-
-    def delete_step(self, section_idx, step_idx):
-        self.recorder.delete_step(section_idx, step_idx)
-        if self.last_recorded_step == (section_idx, step_idx):
-            self.last_recorded_step = None
-        if (section_idx, step_idx) in self.selected_steps:
-            del self.selected_steps[(section_idx, step_idx)]
-        if self._is_visible():
-            self.render_sections()
-        else:
-            self.pending_update = True
-
-    def move_step_up(self, section_idx, step_idx):
-        self.recorder.move_step_up(section_idx, step_idx)
-        if self.last_recorded_step == (section_idx, step_idx):
-            self.last_recorded_step = (section_idx, step_idx - 1)
-        if (section_idx, step_idx) in self.selected_steps:
-            lbl = self.selected_steps.pop((section_idx, step_idx))
-            self.selected_steps[(section_idx, step_idx - 1)] = lbl
-        if self._is_visible():
-            self.render_sections()
-        else:
-            self.pending_update = True
-
-    def move_step_down(self, section_idx, step_idx):
-        self.recorder.move_step_down(section_idx, step_idx)
-        if self.last_recorded_step == (section_idx, step_idx):
-            self.last_recorded_step = (section_idx, step_idx + 1)
-        if (section_idx, step_idx) in self.selected_steps:
-            lbl = self.selected_steps.pop((section_idx, step_idx))
-            self.selected_steps[(section_idx, step_idx + 1)] = lbl
-        if self._is_visible():
-            self.render_sections()
-        else:
-            self.pending_update = True
-
-    def edit_delay(self, section_idx, step_idx):
-        current = self.recorder.snapshot_sections()[section_idx]["steps"][step_idx]
-        value = current.get("delay", 0)
-        try:
-            new_val = simpledialog.askinteger("Edit Delay", "Delay (ms):", initialvalue=int(value), minvalue=0)
-            if new_val is not None:
-                self.recorder.edit_delay(section_idx, step_idx, int(new_val))
-        except Exception:
-            pass
-
-    def add_quick_delay(self):
-        if self.active_section_index is None:
-            messagebox.showerror("Error", "Select a section first.")
-            return
-        try:
-            ms = int(float(self.quick_delay_var.get()))
-        except ValueError:
-            messagebox.showerror("Error", "Enter a valid delay (ms).")
-            return
-        self.recorder.add_delay_step(self.active_section_index, ms)
-
+    # --- Delegate methods ---
+    def add_section(self): self.section.add()
+    def add_string(self):
+        if self.active_section_index is None: messagebox.showerror("Error", "Select a section first."); return
+        add_typed_dialog(self, self.active_section_index)
     def toggle_recording(self):
         if self.recorder.recording:
-            sections = self.recorder.snapshot_sections()
-            if self.active_section_index is not None:
-                steps = sections[self.active_section_index]["steps"]
-                self.last_recorded_step = (self.active_section_index, len(steps) - 1) if steps else None
             self.recorder.stop_recording()
-            self.record_button.config(text="Start Recording", bg="SystemButtonFace")
-            if self._is_visible():
-                self.render_sections()
-            else:
-                self.pending_update = True
+            self.top_bar.update_record_button(False)
+            if self.active_section_index is not None:
+                steps = self.recorder.snapshot_sections()[self.active_section_index]["steps"]
+                self.last_recorded_step = (self.active_section_index, len(steps)-1) if steps else None
         else:
-            if self.active_section_index is None or self.active_section_index >= len(self.recorder.sections):
-                messagebox.showerror("Error", "Select a section first.")
-                return
+            if self.active_section_index is None: messagebox.showerror("Error", "Select a section first."); return
             self.last_recorded_step = None
             self.recorder.start_recording(self.active_section_index)
-            self.record_button.config(text="Stop Recording", bg="red")
-            if self.auto_minimize_var.get():
+            self.top_bar.update_record_button(True)
+            if self.top_bar.get_auto_minimize():
                 self.root.iconify()
+        self.ui.refresh()
 
-    def play_macro(self):
-        self.stop_event = threading.Event()
-        self.pressed = set()
+    def play_macro(self): self.playback.start_playback()
+    def add_quick_delay(self):
+        if self.active_section_index is None: messagebox.showerror("Error", "Select a section first."); return
+        try:
+            ms = int(float(self.top_bar.quick_delay_var.get()))
+            if ms < 0: raise ValueError
+        except: messagebox.showerror("Error", "Enter a valid delay (ms)."); return
+        self.recorder.add_delay_step(self.active_section_index, ms)
 
-        def on_press_key(k):
-            self.pressed.add(k)
-            if {keyboard.Key.ctrl, keyboard.Key.alt, keyboard.Key.enter}.issubset(self.pressed):
-                self.stop_event.set()
+    def save_macro(self, file=None):
+        if not file: file = filedialog.asksaveasfilename(defaultextension=".json")
+        if file: self.recorder.save_macro(file); messagebox.showinfo("Save", "Saved.")
 
-        def on_release_key(k):
-            if k in self.pressed:
-                self.pressed.remove(k)
-
-        self.interrupt_listener = keyboard.Listener(on_press=on_press_key, on_release=on_release_key)
-        self.interrupt_listener.start()
-        threading.Thread(target=self._run_playback, daemon=True).start()
-
-    def _run_playback(self):
-        self.recorder.play_all(self.stop_event)
-        self.finish_playback()
-
-    def finish_playback(self):
-        if self.interrupt_listener:
-            self.interrupt_listener.stop()
-            self.interrupt_listener = None
-        messagebox.showinfo("Playback", "Macro finished." if not self.stop_event.is_set() else "Macro interrupted.")
+    def load_macro(self, file=None):
+        if not file: file = filedialog.askopenfilename()
+        if file:
+            self.recorder.load_macro(file)
+            self.last_recorded_step = None
+            self.selection.clear()
+            self.ui.refresh()
 
     def clear_all(self):
         self.recorder.clear_all()
         self.last_recorded_step = None
-        self.selected_steps.clear()
-        temp_file = "temp_macro.json"
-        if os.path.exists(temp_file):
-            try:
-                os.remove(temp_file)
-            except Exception:
-                pass
-        if self._is_visible():
-            self.render_sections()
-        else:
-            self.pending_update = True
+        self.selection.clear()
+        try: os.remove("temp_macro.json")
+        except: pass
+        self.ui.refresh()
 
-    def save_macro(self, file=None):
-        if file is None:
-            file = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
-        if file:
-            self.recorder.save_macro(file)
-            messagebox.showinfo("Save", "Macro saved.")
-
-    def load_macro(self, file=None):
-        if file is None:
-            file = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
-        if file:
-            self.recorder.load_macro(file)
+    def select_section(self, idx): self.section.select(idx)
+    def delete_section(self, idx): self.section.delete(idx)
+    def move_section_left(self, idx): self.section.move_left(idx)
+    def move_section_right(self, idx): self.section.move_right(idx)
+    def delete_step(self, si, sti):
+        self.selection.clear()
+        self.recorder.delete_step(si, sti)
+        if (si, sti) == self.last_recorded_step:
             self.last_recorded_step = None
-            self.selected_steps.clear()
-            if self._is_visible():
-                self.render_sections()
-            else:
-                self.pending_update = True
-
+        self.ui.refresh()
+    def move_step_up(self, si, sti):
+        self.selection.clear()
+        self.recorder.move_step_up(si, sti)
+        self.ui.refresh()
+    def move_step_down(self, si, sti):
+        self.selection.clear()
+        self.recorder.move_step_down(si, sti)
+        self.ui.refresh()
 
 if __name__ == "__main__":
     root = tk.Tk()
