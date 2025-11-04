@@ -15,10 +15,8 @@ class Recorder:
         self.last_time: Optional[float] = None
         self.pressed_keys: Set[str] = set()
         self._pre_record_len: int = 0
+        self._ui_update_scheduled = False
 
-    # ------------------------------------------------------------------ #
-    # Public API – called by core.py
-    # ------------------------------------------------------------------ #
     def start(self, section_index: Tuple[int, int]):
         row, col = section_index
         with self.core._lock:
@@ -33,6 +31,7 @@ class Recorder:
             self._pre_record_len = len(steps)
             self.pressed_keys.clear()
             self.last_time = time.time() * 1000
+            self._ui_update_scheduled = False
 
             try:
                 self.listener = keyboard.Listener(
@@ -64,19 +63,24 @@ class Recorder:
             if self.core.active_section_index is not None:
                 row, col = self.core.active_section_index
                 steps = self.core.rows[row][col]["steps"]
-                # Remove trailing incomplete events
                 while steps and steps[-1].get("type") in ("mouse_press", "mouse_release", "press", "release"):
                     steps.pop()
-                # Merge raw events into high-level actions
                 new_part = merge_steps(steps[self._pre_record_len:])
                 steps[self._pre_record_len:] = new_part
 
             self.pressed_keys.clear()
             self.core.active_section_index = None
+            self._ui_update_scheduled = False
 
-    # ------------------------------------------------------------------ #
-    # Listener callbacks
-    # ------------------------------------------------------------------ #
+    def _schedule_ui_update(self):
+        if not self._ui_update_scheduled and self.core.ui_callback:
+            self._ui_update_scheduled = True
+            self.core.root.after(50, self._do_ui_update)
+
+    def _do_ui_update(self):
+        self._ui_update_scheduled = False
+        self.core._notify_ui()
+
     def _add_step(self, step: dict):
         if self.core.active_section_index is None:
             return
@@ -93,7 +97,7 @@ class Recorder:
                 self._add_step({"type": "delay", "delay": delay, "unit": "ms"})
             self._add_step({"type": "press", "key": k})
             self.last_time = now
-        self.core._notify_ui()  # outside lock
+        self._schedule_ui_update()
 
     def _on_release(self, key):
         now = time.time() * 1000
@@ -105,7 +109,7 @@ class Recorder:
                 self._add_step({"type": "delay", "delay": delay, "unit": "ms"})
             self._add_step({"type": "release", "key": k})
             self.last_time = now
-        self.core._notify_ui()
+        self._schedule_ui_update()
 
     def _on_mouse_click(self, x, y, button, pressed):
         if not self.core.recording or self.core.active_section_index is None:
@@ -129,4 +133,4 @@ class Recorder:
             {"type": action_type, "x": int(x), "y": int(y), "button": button_str}
         )
         self.last_time = now
-        self.core._notify_ui()
+        self._schedule_ui_update()

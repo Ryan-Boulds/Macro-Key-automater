@@ -22,7 +22,8 @@ class MacroRecorderCore:
 
         self._lock = threading.Lock()
         self._last_ui_update = 0
-        self._ui_update_interval = 0.1  # default 100 ms
+        self._ui_update_interval = 0.1
+        self.root = None  # Will be set by the UI (Tk root)
 
         # sub-components
         self._recorder = Recorder(self)

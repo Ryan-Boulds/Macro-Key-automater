@@ -9,9 +9,9 @@ def step_label(step):
     if t == "delay":
         return f"Delay {step['delay']} {step.get('unit','ms')}"
     elif t == "press":
-        return f"{step['key']} (pressed)"
+        return f"{step['key']} (press)"
     elif t == "release":
-        return f"{step['key']} (released)"
+        return f"{step['key']} (release)"
     elif t == "mouse_press":
         return f"Mouse {step['button']} press @ ({step['x']}, {step['y']})"
     elif t == "mouse_release":
