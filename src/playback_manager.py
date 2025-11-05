@@ -10,19 +10,19 @@ class PlaybackManager:
         self.stop_event: Optional[threading.Event] = None
         self.interrupt_listener = None
         self.pressed = set()
-
-        # NEW: tracks the currently playing step for UI highlighting
-        self.current_step: Optional[Tuple[int, int, int]] = None  # (row_idx, sec_idx, step_idx)
+        self.current_step: Optional[Tuple[int, int, int]] = None
 
     def start_playback(self):
         self.stop_event = threading.Event()
         self.pressed = set()
-        self.current_step = None   # reset at start
+        self.current_step = None
 
         def on_press(k):
             self.pressed.add(k)
-            # Ctrl + Alt + Enter to abort playback
-            if {keyboard.Key.ctrl, keyboard.Key.alt, keyboard.Key.enter}.issubset(self.pressed):
+            # Ctrl + Alt + Enter OR ESC to abort
+            if keyboard.Key.esc in self.pressed:
+                self.stop_event.set()
+            elif {keyboard.Key.ctrl, keyboard.Key.alt, keyboard.Key.enter}.issubset(self.pressed):
                 self.stop_event.set()
 
         def on_release(k):

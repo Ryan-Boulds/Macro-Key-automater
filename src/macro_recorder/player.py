@@ -150,3 +150,17 @@ class PlaybackExecutor:
                 if i < len(chars) - 1:
                     d = delays[i] if i < len(delays) else 15
                     self._sleep_with_interrupt(d / 1000.0, stop_event)
+        elif t == "mouse_drag":
+            pyautogui.moveTo(action["start_x"], action["start_y"])
+            pyautogui.mouseDown(button=action["button"])
+            duration_sec = action["duration_ms"] / 1000.0
+            if duration_sec > 0:
+                # Smooth move along path or direct
+                if "path" in action and len(action["path"]) > 1:
+                    for px, py in action["path"][1:]:
+                        pyautogui.moveTo(px, py, duration=0)
+                else:
+                    pyautogui.moveTo(action["end_x"], action["end_y"], duration=duration_sec)
+            else:
+                pyautogui.moveTo(action["end_x"], action["end_y"])
+            pyautogui.mouseUp(button=action["button"])

@@ -40,7 +40,11 @@ class Recorder:
                 )
                 self.listener.start()
 
-                self.mouse_listener = mouse.Listener(on_click=self._on_mouse_click)
+                # NEW: Motion listener
+                self.mouse_listener = mouse.Listener(
+                    on_click=self._on_mouse_click,
+                    on_move=self._on_mouse_move,   # <--- ADD THIS
+                )
                 self.mouse_listener.start()
             except Exception as e:
                 self.core.recording = False
@@ -63,6 +67,19 @@ class Recorder:
             if self.core.active_section_index is not None:
                 row, col = self.core.active_section_index
                 steps = self.core.rows[row][col]["steps"]
+
+               
+                while steps and steps[-1].get("type") == "mouse_press":
+                    # If the press is followed by a matching release, drop that too.
+                    if (len(steps) >= 2 and
+                        steps[-2].get("type") == "mouse_press" and
+                        steps[-1].get("type") == "mouse_release" and
+                        steps[-2].get("button") == steps[-1].get("button")):
+                        steps.pop()               # drop release
+                    steps.pop()                   # drop press
+                    # Stop after the first press (the one that stopped recording)
+                    break
+
                 while steps and steps[-1].get("type") in ("mouse_press", "mouse_release", "press", "release"):
                     steps.pop()
                 new_part = merge_steps(steps[self._pre_record_len:])
@@ -71,11 +88,15 @@ class Recorder:
             self.pressed_keys.clear()
             self.core.active_section_index = None
             self._ui_update_scheduled = False
+        # end lock
+        self.core._notify_ui()
 
     def _schedule_ui_update(self):
+        """Throttle UI updates to at most ~30 Hz while recording."""
         if not self._ui_update_scheduled and self.core.ui_callback:
             self._ui_update_scheduled = True
-            self.core.root.after(50, self._do_ui_update)
+            # 30 ms ≈ 33 Hz – plenty fast for visual feedback, no flood
+            self.core.root.after(30, self._do_ui_update)
 
     def _do_ui_update(self):
         self._ui_update_scheduled = False
@@ -97,6 +118,7 @@ class Recorder:
                 self._add_step({"type": "delay", "delay": delay, "unit": "ms"})
             self._add_step({"type": "press", "key": k})
             self.last_time = now
+        # <-- throttle here
         self._schedule_ui_update()
 
     def _on_release(self, key):
@@ -132,5 +154,24 @@ class Recorder:
         self._add_step(
             {"type": action_type, "x": int(x), "y": int(y), "button": button_str}
         )
+        self.last_time = now
+        self._schedule_ui_update()
+
+    def _on_mouse_move(self, x, y):
+        if not self.core.recording or self.core.active_section_index is None:
+            return
+        if not self.pressed_keys:  # Only record if a button is held
+            return
+
+        now = time.time() * 1000
+        if self.last_time is not None:
+            delay = int(now - self.last_time)
+            if delay > 0:
+                self._add_step({"type": "delay", "delay": delay, "unit": "ms"})
+        self._add_step({
+            "type": "mouse_move",
+            "x": int(x),
+            "y": int(y),
+        })
         self.last_time = now
         self._schedule_ui_update()

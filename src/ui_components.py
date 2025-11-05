@@ -42,6 +42,8 @@ def step_label(step):
             return f"{btn} click at {pos}"
     elif t == "typed":
         return f"typed: \"{step['chars']}\""
+    elif t == "mouse_drag":
+        return f"Drag {step['button']} from ({step['start_x']}, {step['start_y']}) to ({step['end_x']}, {step['end_y']}) in {step['duration_ms']}ms"
     return "Unknown"
 
 def render_gap_chip(app, gap_index, value_ms):
@@ -66,18 +68,6 @@ def render_gap_chip(app, gap_index, value_ms):
             messagebox.showerror("Error", "Enter a valid delay (ms).")
 
     tk.Button(chip, text="Set ms", command=apply).pack(pady=(0, 6))
-    return frame
-
-    def apply():
-        try:
-            ms = int(float(var.get()))
-        except ValueError:
-            messagebox.showerror("Error", "Enter a valid delay (ms).")
-            return
-        app.recorder.set_between_delay(gap_index, ms)
-
-    btn = tk.Button(chip, text="Set ms", command=apply)
-    btn.pack(padx=6, pady=(0, 6))
     return frame
 
 def render_section(app, idx, section):

@@ -4,19 +4,28 @@ from typing import List, Dict, Any
 
 def merge_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Takes a raw list of press/release/delay steps and returns a compacted list
-    containing:
-      * mouse_click (with optional hold_ms + release coordinates)
-      * typed (merged characters + per-char delays)
-      * key_group (modifier combos)
-      * plain delay steps
+    Convert raw press/release/delay/mouse_move into high-level actions:
+      - mouse_click
+      - mouse_drag
+      - typed
+      - key_group
+      - delay
     """
     new_steps: List[Dict[str, Any]] = []
     i = 0
-    modifier_keys = {
-        "cmd", "cmd_r", "win", "ctrl", "alt", "shift",
-        "enter", "tab", "esc", "backspace", "delete"
+
+    # Keys that **break** a typed string
+    NON_CHAR_KEYS = {
+        "enter", "tab", "esc", "backspace", "delete",
+        "up", "down", "left", "right",
+        "page_up", "page_down", "home", "end", "insert",
+        "f1", "f2", "f3", "f4", "f5", "f6",
+        "f7", "f8", "f9", "f10", "f11", "f12",
     }
+
+    # Pure modifiers (for key_group)
+    MODIFIER_KEYS = {"cmd", "cmd_r", "win", "ctrl", "alt", "shift"}
+
     shift_map = {
         "1": "!", "2": "@", "3": "#", "4": "$", "5": "%",
         "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
@@ -24,127 +33,160 @@ def merge_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     }
     allowed_chars = set("abcdefghijklmnopqrstuvwxyz0123456789. ")
 
+    def _flush_typed(chars: List[str], delays: List[int]):
+        if chars:
+            new_steps.append({
+                "type": "typed",
+                "chars": "".join(chars),
+                "delays": delays or [15] * (len(chars) - 1)
+            })
+
     while i < len(steps):
         step = steps[i]
 
         # ------------------------------------------------------------------
-        # Non-keyboard actions (mouse, delay, etc.)
+        # Mouse Press → start of click or drag
         # ------------------------------------------------------------------
-        if step["type"] not in ("press", "release", "delay"):
-            if step["type"] == "mouse_press":
-                mouse_step = {
+        if step["type"] == "mouse_press":
+            drag_step = {
+                "type": "mouse_drag",
+                "button": step["button"],
+                "start_x": step["x"],
+                "start_y": step["y"],
+                "path": [(step["x"], step["y"])],
+                "duration_ms": 0,
+            }
+            i += 1
+            released = False
+
+            while i < len(steps):
+                nxt = steps[i]
+
+                if nxt["type"] == "delay":
+                    drag_step["duration_ms"] += nxt["delay"]
+                    i += 1
+                elif nxt["type"] == "mouse_move":
+                    x, y = nxt["x"], nxt["y"]
+                    if (x, y) != drag_step["path"][-1]:  # avoid duplicates
+                        drag_step["path"].append((x, y))
+                    i += 1
+                elif nxt["type"] == "mouse_release" and nxt["button"] == step["button"]:
+                    drag_step["end_x"] = nxt["x"]
+                    drag_step["end_y"] = nxt["y"]
+                    released = True
+                    i += 1
+                    break
+                else:
+                    break
+
+            # Finalize drag
+            if released and len(drag_step["path"]) > 1:
+                # Downsample path for smooth playback (max 50 points)
+                if len(drag_step["path"]) > 50:
+                    step = len(drag_step["path"]) // 50
+                    drag_step["path"] = drag_step["path"][::step]
+                new_steps.append(drag_step)
+            else:
+                # No movement or no release → treat as click
+                new_steps.append({
                     "type": "mouse_click",
                     "button": step["button"],
                     "x": step["x"],
                     "y": step["y"],
-                    "hold_ms": 0,
-                }
-                i += 1
-                while i < len(steps):
-                    nxt = steps[i]
-                    if nxt["type"] == "delay":
-                        mouse_step["hold_ms"] += nxt["delay"]
-                        i += 1
-                    elif (nxt["type"] == "mouse_release" and
-                          nxt["button"] == step["button"]):
-                        mouse_step["release_x"] = nxt["x"]
-                        mouse_step["release_y"] = nxt["y"]
-                        i += 1
-                        break
-                    else:
-                        break
-                new_steps.append(mouse_step)
-            else:
-                new_steps.append(step)
-                i += 1
+                    "hold_ms": drag_step["duration_ms"],
+                })
             continue
 
         # ------------------------------------------------------------------
-        # Keyboard sequence handling
+        # Other non-keyboard steps
         # ------------------------------------------------------------------
-        sub_steps: List[Dict[str, Any]] = []
-        typed_chars: List[str] = []
-        typed_delays: List[int] = []
-        pressed_keys: set = set()
+        if step["type"] not in ("press", "release", "delay", "mouse_move"):
+            new_steps.append(step)
+            i += 1
+            continue
+
+        # ------------------------------------------------------------------
+        # Keyboard block
+        # ------------------------------------------------------------------
+        sub_steps = []
+        typed_chars, typed_delays = [], []
+        pressed_keys = set()
         shift_pressed = False
         j = i
-        while j < len(steps):
-            s = steps[j]
-            if s["type"] in ("press", "release", "delay"):
-                sub_steps.append(s)
-                if s["type"] == "press":
-                    pressed_keys.add(s["key"])
-                    if s["key"] == "shift":
-                        shift_pressed = True
-                elif s["type"] == "release" and s["key"] in pressed_keys:
-                    pressed_keys.remove(s["key"])
-                    if s["key"] == "shift":
-                        shift_pressed = False
-                j += 1
-            else:
-                break
 
-        # ---- process the collected sub_steps --------------------------------
+        while j < len(steps) and steps[j]["type"] in ("press", "release", "delay", "mouse_move"):
+            if steps[j]["type"] == "mouse_move":
+                break  # mouse move breaks keyboard block
+            sub_steps.append(steps[j])
+            s = steps[j]
+            if s["type"] == "press":
+                pressed_keys.add(s["key"])
+                if s["key"] == "shift":
+                    shift_pressed = True
+            elif s["type"] == "release" and s["key"] in pressed_keys:
+                pressed_keys.remove(s["key"])
+                if s["key"] == "shift":
+                    shift_pressed = False
+            j += 1
+
         k = 0
-        current_key_group: List[Dict[str, Any]] = []
-        last_delay = 0
+        current_key_group = []
 
         while k < len(sub_steps):
             s = sub_steps[k]
 
+            # Delay
             if s["type"] == "delay":
-                last_delay = s["delay"]
                 current_key_group.append(s)
                 k += 1
                 continue
 
-            if s["type"] == "press" and s["key"] in modifier_keys:
+            # Modifier press
+            if s["type"] == "press" and s["key"] in MODIFIER_KEYS:
                 current_key_group.append(s)
                 k += 1
                 continue
 
-            if s["type"] == "release" and s["key"] in modifier_keys and s["key"] in pressed_keys:
+            # Modifier release
+            if s["type"] == "release" and s["key"] in MODIFIER_KEYS:
                 current_key_group.append(s)
-                pressed_keys.remove(s["key"])
+                pressed_keys.discard(s["key"])
                 k += 1
-                # flush key_group when all modifiers are released
-                if not pressed_keys or all(p in modifier_keys for p in pressed_keys):
-                    if current_key_group and not all(
-                        ss.get("key") == "shift" or ss["type"] == "delay"
-                        for ss in current_key_group
-                    ):
+                if not any(p in MODIFIER_KEYS for p in pressed_keys):
+                    if current_key_group:
                         new_steps.append({"type": "key_group", "sub_steps": current_key_group})
                     current_key_group = []
                 continue
 
-            # ---- regular printable character ---------------------------------
+            # Non-char key → split typed
+            if s["type"] == "press" and s["key"] in NON_CHAR_KEYS:
+                _flush_typed(typed_chars, typed_delays)
+                typed_chars.clear()
+                typed_delays.clear()
+                current_key_group.append(s)
+                k += 1
+                continue
+
+            # Printable char
             if s["type"] == "press" and (
                 s["key"] in allowed_chars or
                 s["key"] == "space" or
                 (shift_pressed and s["key"] in shift_map)
             ):
-                # flush any pending key_group first
-                if current_key_group and not all(
-                    ss.get("key") == "shift" or ss["type"] == "delay"
-                    for ss in current_key_group
-                ):
+                if current_key_group:
                     new_steps.append({"type": "key_group", "sub_steps": current_key_group})
                     current_key_group = []
 
-                char = shift_map[s["key"]] if shift_pressed and s["key"] in shift_map else (
+                char = shift_map.get(s["key"], s["key"]) if shift_pressed and s["key"] in shift_map else (
                     " " if s["key"] == "space" else s["key"]
                 )
                 typed_chars.append(char)
                 k += 1
 
-                # consume release + optional delay
+                # Consume release + delay
                 while k < len(sub_steps):
                     nxt = sub_steps[k]
-                    if nxt["type"] == "release" and (
-                        nxt["key"] == s["key"] or
-                        (nxt["key"] == "shift" and shift_pressed) or
-                        nxt["key"] == "space"
-                    ):
+                    if nxt["type"] == "release" and nxt["key"] in (s["key"], "shift", "space"):
                         if nxt["key"] == "shift":
                             shift_pressed = False
                         k += 1
@@ -156,21 +198,11 @@ def merge_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                         break
                 continue
 
-            k += 1  # unknown step – skip
+            k += 1
 
-        # ---- final typed block ---------------------------------------------
-        if typed_chars:
-            new_steps.append({
-                "type": "typed",
-                "chars": "".join(typed_chars),
-                "delays": typed_delays or [15] * (len(typed_chars) - 1)
-            })
-
-        # ---- leftover key_group --------------------------------------------
-        if current_key_group and not all(
-            ss.get("key") == "shift" or ss["type"] == "delay"
-            for ss in current_key_group
-        ):
+        # Final flush
+        _flush_typed(typed_chars, typed_delays)
+        if current_key_group:
             new_steps.append({"type": "key_group", "sub_steps": current_key_group})
 
         i = j
