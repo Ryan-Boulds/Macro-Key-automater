@@ -1,3 +1,4 @@
+# src/ui_components.py
 import tkinter as tk
 from tkinter import messagebox
 
@@ -46,13 +47,21 @@ def step_label(step):
         return f"Drag {step['button']} from ({step['start_x']}, {step['start_y']}) to ({step['end_x']}, {step['end_y']}) in {step['duration_ms']}ms"
     return "Unknown"
 
-def render_gap_chip(app, gap_index, value_ms):
-    frame = tk.Frame(app.sections_frame, width=60)
-    frame.pack_propagate(False)  # Prevent resizing
+
+def render_gap_chip(app, gap_index, value_ms, parent=None):
+    if parent is None:
+        parent = app.main_frame
+
+    frame = tk.Frame(parent, width=60)
+    frame.pack_propagate(False)
 
     chip = tk.Frame(frame, bd=1, relief="ridge", bg="white")
     chip.pack(fill="both", expand=True, padx=2, pady=2)
-    app.gap_chips[gap_index[0]].append(chip)
+
+    row_idx = gap_index[0]
+    while len(app.gap_chips) <= row_idx:
+        app.gap_chips.append([])
+    app.gap_chips[row_idx].append(chip)
 
     tk.Label(chip, text="Between", font=("TkDefaultFont", 8)).pack(pady=(6, 0))
     var = tk.StringVar(value=str(value_ms))
@@ -62,7 +71,8 @@ def render_gap_chip(app, gap_index, value_ms):
     def apply():
         try:
             ms = int(float(var.get()))
-            if ms < 0: raise ValueError
+            if ms < 0:
+                raise ValueError
             app.recorder.set_gap_delay(gap_index, ms)
         except ValueError:
             messagebox.showerror("Error", "Enter a valid delay (ms).")
@@ -70,11 +80,15 @@ def render_gap_chip(app, gap_index, value_ms):
     tk.Button(chip, text="Set ms", command=apply).pack(pady=(0, 6))
     return frame
 
-def render_section(app, idx, section):
+
+def render_section(app, idx, section, parent=None):
+    if parent is None:
+        parent = app.main_frame
+
     is_active = (idx == app.active_section_index)
     border_color = "#0078D7" if is_active else "#cccccc"
 
-    frame = tk.Frame(app.sections_frame, bd=2, relief="groove", highlightthickness=2)
+    frame = tk.Frame(parent, bd=2, relief="groove", highlightthickness=2)
     frame.configure(highlightbackground=border_color, highlightcolor=border_color)
 
     # Header
@@ -100,7 +114,17 @@ def render_section(app, idx, section):
     steps_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
     row_idx, sec_idx = idx
+
+    # Ensure structures
+    while len(app.step_labels) <= row_idx:
+        app.step_labels.append([])
+    while len(app.step_labels[row_idx]) <= sec_idx:
+        app.step_labels[row_idx].append([])
     app.step_labels[row_idx][sec_idx] = []
+
+    # Ensure step_menus exists
+    if not hasattr(app, 'step_menus'):
+        app.step_menus = []
 
     for s_idx, step in enumerate(section["steps"]):
         step_frame = tk.Frame(steps_wrap)
@@ -113,13 +137,15 @@ def render_section(app, idx, section):
         elif ((row_idx, sec_idx), s_idx) in app.selection.selected_indices:
             bg_color = "#D3D3D3"
 
-
-        lbl = tk.Label(step_frame, text=text, bd=1, relief="solid", width=STEP_WIDTH, height=STEP_HEIGHT,
-                       anchor="w", justify="left", bg=bg_color, wraplength=300)
+        lbl = tk.Label(
+            step_frame, text=text, bd=1, relief="solid",
+            width=STEP_WIDTH, height=STEP_HEIGHT,
+            anchor="w", justify="left", bg=bg_color, wraplength=300
+        )
         lbl.pack(side="left", fill="x", expand=True)
         app.step_labels[row_idx][sec_idx].append(lbl)
 
-        # Click to select
+        # Selection
         def make_toggle(si, sti):
             def toggle(event):
                 app.selection.toggle(si, sti, lbl, event.state & 0x4)
@@ -134,12 +160,16 @@ def render_section(app, idx, section):
             menu.add_command(label="Edit Delay...", command=lambda: messagebox.showinfo("Edit", "Not implemented yet"))
 
         def show_menu(e, m=menu):
-            try: m.tk_popup(e.x_root, e.y_root)
-            finally: m.grab_release()
+            try:
+                m.tk_popup(e.x_root, e.y_root)
+            finally:
+                m.grab_release()
         lbl.bind("<Button-3>", show_menu)
 
     return frame
 
+
+# === FULL DIALOGS (exactly as you wrote them) ===
 def add_typed_dialog(app, section_idx):
     dialog = tk.Toplevel(app.root)
     dialog.title("Add Typed String")
@@ -169,6 +199,7 @@ def add_typed_dialog(app, section_idx):
         dialog.destroy()
     tk.Button(dialog, text="Save", command=save).pack(pady=10)
 
+
 def edit_key_group(app, section_idx, step_idx):
     sections = app.recorder.snapshot_sections()
     step = sections[section_idx]["steps"][step_idx]
@@ -180,7 +211,6 @@ def edit_key_group(app, section_idx, step_idx):
     frame = tk.Frame(dialog)
     frame.pack(pady=10, padx=10)
 
-    # Convert sub_steps to string if possible
     chars = []
     modifier_keys = {"cmd", "cmd_r", "win", "ctrl", "alt", "shift", "enter", "tab", "esc", "backspace", "delete"}
     shift_pressed = False
@@ -207,7 +237,6 @@ def edit_key_group(app, section_idx, step_idx):
                 shift_pressed = False
             current_char = None
 
-    # Display current sub-steps
     entries = []
     for idx, sub in enumerate(sub_steps):
         if sub["type"] == "delay":
@@ -220,7 +249,6 @@ def edit_key_group(app, section_idx, step_idx):
             action = "Press" if sub["type"] == "press" else "Release"
             tk.Label(frame, text=f"{action} {sub['key']}").grid(row=idx, column=0, columnspan=2)
 
-    # Add string edit option
     tk.Label(frame, text="Convert to String (optional):").grid(row=len(sub_steps), column=0)
     string_var = tk.StringVar(value="".join(chars) if chars else "")
     tk.Entry(frame, textvariable=string_var, width=30).grid(row=len(sub_steps), column=1)
@@ -244,14 +272,12 @@ def edit_key_group(app, section_idx, step_idx):
                     return
             with app.recorder._lock:
                 if new_string:
-                    # Convert to typed step
                     app.recorder.sections[section_idx]["steps"][step_idx] = {
                         "type": "typed",
                         "chars": new_string,
                         "delays": [delay] * (len(new_string) - 1)
                     }
                 else:
-                    # Update existing sub_steps
                     app.recorder.sections[section_idx]["steps"][step_idx]["sub_steps"] = sub_steps
             app.render_sections()
             dialog.destroy()
@@ -259,6 +285,7 @@ def edit_key_group(app, section_idx, step_idx):
             messagebox.showerror("Error", "Invalid delay.")
             return
     tk.Button(dialog, text="Save", command=save).pack(pady=10)
+
 
 def edit_mouse_click(app, section_idx, step_idx):
     sections = app.recorder.snapshot_sections()
@@ -301,6 +328,7 @@ def edit_mouse_click(app, section_idx, step_idx):
         app.render_sections()
         dialog.destroy()
     tk.Button(dialog, text="Save", command=save).pack(pady=10)
+
 
 def edit_typed(app, section_idx, step_idx):
     sections = app.recorder.snapshot_sections()

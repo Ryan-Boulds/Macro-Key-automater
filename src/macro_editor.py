@@ -10,7 +10,7 @@ from playback_manager import PlaybackManager
 from selection_manager import SelectionManager
 from section_manager import SectionManager
 from ui_updater import UIUpdater
-from ui_components import render_section, render_gap_chip, add_typed_dialog
+from ui_components import render_section, render_gap_chip, add_typed_dialog, step_label
 
 
 class MacroEditorApp:
@@ -29,19 +29,24 @@ class MacroEditorApp:
         self.section = SectionManager(self)
         self.ui = UIUpdater(self)
 
-        self.step_labels = []          # step_labels[row][sec] = list of Labels
-        self.step_menus = []
-        self.gap_chips = []            # within-row gaps
-        self.row_gap_chips = []        # between-row gaps
-        self.last_recorded_step = None # (row, sec, step)
+        self.step_labels = []
+        self.gap_chips = []
+        self.row_gap_chips = []
+        self.row_canvases = []  # (canvas, inner_frame)
+        self.last_recorded_step = None
         self.active_row_index = 0
-        self.active_section_index = None  # (row, sec)
+        self.active_section_index = None
 
         self.pending_update = False
-        self.append_after_id = None    # For batching appends
-        self.pending_steps = []        # Buffer for batched append
+        self.append_after_id = None
+        self.pending_steps = []
+
+        # === LAYOUT ===
+        self.top_bar = TopBar(self.root, self)
+        self.top_bar.frame.pack(side="top", fill="x")
 
         self._setup_canvas()
+
         if os.path.exists("temp_macro.json"):
             self.load_macro("temp_macro.json")
         if not self.recorder.rows:
@@ -51,6 +56,47 @@ class MacroEditorApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         self.root.bind("<FocusIn>", lambda e: self._on_focus())
         self.root.bind("<Map>", lambda e: self._on_focus())
+
+    def _setup_canvas(self):
+        self.main_canvas = tk.Canvas(self.root)
+        self.v_scrollbar = tk.Scrollbar(self.root, orient="vertical", command=self.main_canvas.yview)
+        self.main_canvas.configure(yscrollcommand=self.v_scrollbar.set)
+
+        self.v_scrollbar.pack(side="right", fill="y")
+        self.main_canvas.pack(side="top", fill="both", expand=True)
+
+        self.h_scrollbar = tk.Scrollbar(self.root, orient="horizontal", command=self._h_scroll)
+        self.h_scrollbar.pack(side="bottom", fill="x")
+
+        self.main_frame = tk.Frame(self.main_canvas)
+        self.main_canvas.create_window((0, 0), window=self.main_frame, anchor="nw", tags="inner")
+
+        self.main_frame.bind("<Configure>", self._on_frame_configure)
+        self.main_canvas.bind("<Configure>", self._on_canvas_configure)
+
+    def _on_frame_configure(self, event=None):
+        self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self.main_canvas.itemconfig("inner", width=event.width)
+
+    def _h_scroll(self, *args):
+        for row_canvas, _ in self.row_canvases:
+            row_canvas.xview(*args)
+
+    def _row_xscroll(self, *args):
+        if not self.row_canvases:
+            return
+        first = self.row_canvases[0][0]
+        if first.xview() != (float(args[0]), float(args[1])):
+            for canvas, _ in self.row_canvases:
+                canvas.xview_moveto(args[0])
+        self.h_scrollbar.set(*args)
+
+    def _sync_h_scrollbars(self):
+        if self.row_canvases:
+            x0, x1 = self.row_canvases[0][0].xview()
+            self.h_scrollbar.set(x0, x1)
 
     def _is_visible(self):
         return self.root.winfo_viewable() and self.root.state() == "normal"
@@ -79,58 +125,46 @@ class MacroEditorApp:
         if not self.pending_steps:
             self.append_after_id = None
             return
-        steps_to_add = self.pending_steps
-        self.pending_steps = []
+        steps = self.pending_steps[:]
+        self.pending_steps.clear()
         self.append_after_id = None
 
-        for r, s, step, idx in steps_to_add:
-            if (r >= len(self.step_labels) or s >= len(self.step_labels[r]) or
-                idx < len(self.step_labels[r][s])):
+        for r, s, step, idx in steps:
+            if r >= len(self.row_canvases) or s >= len(self.step_labels[r]):
                 continue
+            container = self.row_canvases[r][1]
             lbl = tk.Label(
-                self.sections_frame,
+                container,
                 text=step_label(step),
-                anchor="w",
-                justify="left",
-                bg="white",
-                relief="ridge",
-                bd=1,
-                padx=4,
-                pady=2
+                anchor="w", justify="left",
+                bg="white", relief="ridge", bd=1, padx=4, pady=2
             )
-            lbl.pack(fill="x", pady=1)
+            lbl.pack(side="top", fill="x", pady=1)
             self.step_labels[r][s].append(lbl)
-            self._bind_step(lbl, (r, s), idx)
+            self._bind_step(lbl, (r, s), len(self.step_labels[r][s]) - 1)
+
         self.ui.refresh()
+        self._sync_h_scrollbars()
+        for canvas, _ in self.row_canvases:
+            canvas.configure(scrollregion=canvas.bbox("all"))
 
     def _bind_step(self, lbl, si, sti):
-        def on_click(e, shift=tk.SHIFT, ctrl=tk.CTRL):
-            ctrl_held = bool(e.state & ctrl)
+        def on_click(e):
+            ctrl_held = bool(e.state & 0x4)
             self.selection.toggle(si, sti, lbl, ctrl_held)
         lbl.bind("<Button-1>", on_click)
 
-    def _setup_canvas(self):
-        canvas = tk.Canvas(self.root)
-        scrollbar = tk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        self.sections_frame = tk.Frame(canvas)
-        canvas.create_window((0, 0), window=self.sections_frame, anchor="nw")
-        self.sections_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
-        self.top_bar = TopBar(self.root, self)
-        self.top_bar.frame.pack(fill="x")
-
     def render_sections(self):
         if self.recorder.recording and self.active_section_index:
-            return  # Skip full render during recording
-        for widget in self.sections_frame.winfo_children():
+            return
+
+        for widget in self.main_frame.winfo_children():
             widget.destroy()
+
         self.step_labels = []
         self.gap_chips = []
         self.row_gap_chips = []
+        self.row_canvases = []
 
         rows = self.recorder.snapshot_rows()
         within = self.recorder.snapshot_within_rows()
@@ -139,24 +173,36 @@ class MacroEditorApp:
         for r_idx, row in enumerate(rows):
             self.step_labels.append([])
             self.gap_chips.append([])
-            row_frame = tk.Frame(self.sections_frame)
-            row_frame.pack(fill="x", pady=8)
+
+            row_canvas = tk.Canvas(self.main_frame, height=320, highlightthickness=0)
+            row_frame = tk.Frame(row_canvas)
+            row_canvas.create_window((0, 0), window=row_frame, anchor="nw")
+            row_frame.bind("<Configure>", lambda e, c=row_canvas: c.configure(scrollregion=c.bbox("all")))
+
+            row_canvas.configure(xscrollcommand=self._row_xscroll)
+            row_canvas.pack(side="top", fill="x", padx=10, pady=8)
+            self.row_canvases.append((row_canvas, row_frame))
 
             for s_idx, section in enumerate(row):
                 self.step_labels[r_idx].append([])
-                sec_frame = render_section(self, (r_idx, s_idx), section)
+                # Pass row_frame instead of app.sections_frame
+                sec_frame = render_section(self, (r_idx, s_idx), section, parent=row_frame)
                 sec_frame.pack(side="left", padx=8)
+
                 if s_idx < len(row) - 1:
                     gap_frame = render_gap_chip(self, (r_idx, s_idx), within[r_idx][s_idx])
-                    gap_frame.pack(side="left", padx=4)
+                    gap_frame.pack(in_=row_frame, side="left", padx=4)
 
             if r_idx < len(rows) - 1:
                 gap_frame = render_gap_chip(self, (r_idx, -1), between[r_idx])
-                gap_frame.pack(in_=row_frame, side="bottom", pady=4)
+                gap_frame.pack(in_=self.main_frame, side="top", pady=6)
                 self.row_gap_chips.append(gap_frame)
 
         self.ui.refresh()
+        self._on_frame_configure()
+        self._sync_h_scrollbars()
 
+    # === Rest of methods unchanged ===
     def add_row(self):
         self.recorder.add_row()
         self.active_row_index = len(self.recorder.rows) - 1
@@ -181,13 +227,13 @@ class MacroEditorApp:
             self.recorder.stop_recording()
             self.top_bar.update_record_button(False)
             self.last_recorded_step = None
-            self.root.after(100, self.render_sections)  # Rebuild once after stop
+            self.root.after(100, self.render_sections)
         else:
             if self.active_section_index is None:
                 messagebox.showerror("Error", "Select a section first.")
                 return
             r, s = self.active_section_index
-            self.step_labels[r][s] = []  # Clear for incremental
+            self.step_labels[r][s] = []
             self.recorder.start_recording(self.active_section_index)
             self.top_bar.update_record_button(True)
             if self.top_bar.get_auto_minimize():
@@ -202,7 +248,8 @@ class MacroEditorApp:
             return
         try:
             ms = int(float(self.top_bar.quick_delay_var.get()))
-            if ms < 0: raise ValueError
+            if ms < 0:
+                raise ValueError
         except Exception:
             messagebox.showerror("Error", "Enter a valid delay (ms).")
             return
@@ -230,8 +277,10 @@ class MacroEditorApp:
         self.recorder.clear_all()
         self.last_recorded_step = None
         self.selection.clear()
-        try: os.remove("temp_macro.json")
-        except: pass
+        try:
+            os.remove("temp_macro.json")
+        except:
+            pass
         self.add_row()
         self.render_sections()
 
@@ -263,23 +312,15 @@ class MacroEditorApp:
         if not self.recorder.recording:
             self.render_sections()
 
-    def move_step_up(self, sec_idx, step_idx):
-        self.recorder.move_step_up(sec_idx, step_idx)
-        if not self.recorder.recording:
-            self.render_sections()
-
-    def move_step_down(self, sec_idx, step_idx):
-        self.recorder.move_step_down(sec_idx, step_idx)
-        if not self.recorder.recording:
-            self.render_sections()
-
     def _playback_highlight(self, section_idx, step_idx, active):
-        pass  # Handled by UIUpdater
+        pass
 
     def _on_closing(self):
         if os.path.exists("temp_macro.json"):
-            try: os.remove("temp_macro.json")
-            except: pass
+            try:
+                os.remove("temp_macro.json")
+            except:
+                pass
         self.root.destroy()
 
 
